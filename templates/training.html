@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Train Model — Invictus Annotate</title>
+  <meta name="description" content="Train YOLO object detection models on your annotated datasets with real-time monitoring."/>
+  <link rel="stylesheet" href="/static/css/main.css"/>
+  <link rel="stylesheet" href="/static/css/training.css?v=3.0.0"/>
+</head>
+<body>
+
+  <!-- ── Topbar ─────────────────────────────────────────────────────── -->
+  <header class="topbar">
+    <div class="topbar-brand">
+      <div class="logo-dot"></div>
+      Invictus Annotate
+      <span style="font-size:10px;background:rgba(34,211,160,0.15);color:var(--green);padding:2px 7px;border-radius:100px;font-weight:600">TRAIN</span>
+    </div>
+    <div class="topbar-spacer"></div>
+    <div class="conn-indicator">
+      <div class="conn-dot" id="conn-dot"></div>
+      <span id="conn-label">Connecting</span>
+    </div>
+    <a href="javascript:history.back()" class="btn btn-ghost btn-sm">← Back</a>
+    <button class="btn btn-ghost btn-sm" onclick="IA.logout()">Sign out</button>
+  </header>
+
+  <div class="training-root">
+
+    <!-- ── System Info Banner ──────────────────────────────────────── -->
+    <div class="sys-banner" id="sys-banner">
+      <div class="sys-info-cards" id="sys-info-cards">
+        <div class="sys-card">
+          <div class="sys-label">Hardware Mode</div>
+          <div class="sys-value" id="si-gpu">Loading…</div>
+        </div>
+        <div class="sys-card">
+          <div class="sys-label">VRAM / GPU</div>
+          <div class="sys-value" id="si-vram">—</div>
+        </div>
+        <div class="sys-card">
+          <div class="sys-label">CUDA (Driver)</div>
+          <div class="sys-value" id="si-cuda-drv">—</div>
+        </div>
+        <div class="sys-card">
+          <div class="sys-label">CUDA (Runtime)</div>
+          <div class="sys-value" id="si-cuda-rt">—</div>
+        </div>
+        <div class="sys-card">
+          <div class="sys-label">PyTorch</div>
+          <div class="sys-value" id="si-torch">—</div>
+        </div>
+        <div class="sys-card">
+          <div class="sys-label">Ultralytics</div>
+          <div class="sys-value" id="si-ultr">—</div>
+        </div>
+        <div class="sys-card">
+          <div class="sys-label">CPU Cores</div>
+          <div class="sys-value" id="si-cpu">—</div>
+        </div>
+        <div class="sys-card">
+          <div class="sys-label">System RAM</div>
+          <div class="sys-value" id="si-ram">—</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Training Status Banner (shown during active training) ──── -->
+    <div class="train-status-banner hidden" id="train-status-banner">
+      <div class="train-status-text">
+        <div class="train-pulse"></div>
+        Training Active
+      </div>
+      <div class="epoch-progress-bar">
+        <div class="ep-label">
+          <span id="ep-label-text">Epoch 0 / 0</span>
+          <span id="ep-pct-text">0%</span>
+        </div>
+        <div class="ep-track"><div class="ep-fill" id="ep-fill" style="width:0%"></div></div>
+      </div>
+      <div class="train-elapsed" id="train-elapsed">00:00:00</div>
+      <div class="train-eta hidden" id="train-eta">
+        <span style="color:var(--text-muted);font-size:10px">ETA</span>
+        <span id="train-eta-val" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent-light)">—</span>
+      </div>
+      <button class="btn btn-danger btn-sm" id="btn-stop" onclick="confirmStop()">&#9209; Stop Training</button>
+    </div>
+
+    <!-- ── Main content ────────────────────────────────────────────── -->
+    <div class="training-content">
+
+      <!-- ══════════════════════════════════════════════════════════════
+           PHASE 1: Setup
+           ══════════════════════════════════════════════════════════════ -->
+      <div id="setup-container">
+
+        <!-- Step 1: Dataset -->
+        <div class="setup-step active" id="step-dataset">
+          <div class="step-header">
+            <div class="step-num active" id="stepnum-1">1</div>
+            <div class="step-title">Select Dataset</div>
+            <span class="step-status-tag pending" id="steptag-dataset">Not selected</span>
+          </div>
+          <div class="step-body">
+            <p style="color:var(--text-secondary);font-size:13px;margin-bottom:14px">
+              Select the folder containing your exported dataset (with <code>train/</code>, <code>valid/</code>, <code>test/</code> subfolders and a <code>data.yaml</code>).
+            </p>
+            <div class="dataset-pick-row">
+              <input class="form-input" id="dataset-path-input" placeholder="e.g. D:\Invictus_Annotate\dataset\MyProject_dataset"
+                oninput="onDatasetPathInput()" style="flex:1;min-width:260px"/>
+              <button class="btn btn-primary" onclick="pickDatasetFolder()">&#128193; Browse…</button>
+              <button class="btn btn-secondary" onclick="validateCurrentPath()" id="btn-validate">Validate</button>
+            </div>
+
+            <!-- Dataset validation info (hidden until validated) -->
+            <div id="dataset-info" class="hidden">
+              <div class="dataset-info-grid" id="splits-grid"></div>
+
+              <div class="yaml-info-row" id="yaml-info-row">
+                <span id="yaml-status-icon">&#128196;</span>
+                <span id="yaml-status-text" style="font-weight:600;font-size:13px"></span>
+                <input class="form-input" id="yaml-path-input" placeholder="Path to data.yaml…" style="flex:1;min-width:200px"/>
+                <button class="btn btn-secondary btn-sm" onclick="pickYamlFile()" id="btn-pick-yaml">Browse…</button>
+              </div>
+
+              <div class="validation-errors" id="validation-errors"></div>
+
+              <!-- Dataset Intelligence Panel -->
+              <div class="dataset-intel hidden" id="dataset-intel">
+                <div class="intel-header">&#128202; Dataset Intelligence</div>
+                <div class="intel-stats-row" id="intel-stats-row"></div>
+                <div class="intel-split-bar-wrap hidden" id="intel-split-bar-wrap"></div>
+                <div class="intel-classes-row hidden" id="intel-classes-row"></div>
+              </div>
+
+              <!-- System Capabilities + Memory Allocation -->
+              <div class="sys-detail-panel hidden" id="sys-detail-panel">
+                <div class="sys-detail-header">
+                  <span>&#128421; System Capabilities</span>
+                  <span class="sys-mode-badge" id="sys-mode-badge">CPU Mode</span>
+                </div>
+                <div class="sys-detail-grid" id="sys-detail-grid"></div>
+                <div class="memory-slider-section" id="memory-slider-section">
+                  <div class="mem-slider-header">
+                    <span id="mem-slider-label">Allocate RAM for Training</span>
+                    <span class="mem-readout" id="mem-readout">— GB (—%)</span>
+                  </div>
+                  <div class="mem-slider-wrap">
+                    <input type="range" id="mem-slider" min="0.5" max="16" step="0.5" value="4"
+                      oninput="onMemorySliderChange(this.value)"/>
+                  </div>
+                  <div class="mem-capacity-track">
+                    <div class="mem-capacity-bar" id="mem-capacity-bar" style="width:0%"></div>
+                  </div>
+                  <div class="mem-slider-hint" id="mem-slider-hint">Allocating this amount for training processes.</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- AI Recommendation Card -->
+        <div class="rec-card hidden" id="rec-card">
+          <div class="rec-card-header">
+            <span>&#10024; AI Recommendation</span>
+            <span class="rec-confidence-badge" id="rec-confidence-badge">Optimal</span>
+          </div>
+          <div class="rec-summary" id="rec-summary"></div>
+          <div class="rec-fields-grid" id="rec-fields-grid"></div>
+          <div class="rec-card-actions">
+            <button class="btn btn-amber btn-sm" id="btn-apply-model" onclick="applyModelRecommendation()">
+              &#128161; Apply Recommended Model
+            </button>
+            <button class="btn btn-secondary btn-sm" id="btn-apply-params" onclick="applyParamRecommendations()" disabled>
+              Apply Recommended Params
+            </button>
+            <span class="rec-note" id="rec-note">Select a model to unlock parameter recommendations.</span>
+          </div>
+        </div>
+
+        <!-- Step 2: Model Selection -->
+        <div class="setup-step" id="step-model" style="margin-top:14px">
+          <div class="step-header">
+            <div class="step-num" id="stepnum-2">2</div>
+            <div class="step-title">Select YOLO Model</div>
+            <span class="step-status-tag pending" id="steptag-model">Not selected</span>
+          </div>
+          <div class="step-body">
+            <p style="color:var(--text-secondary);font-size:13px;margin-bottom:14px">
+              Nano &amp; Small models are highly recommended for CPU training.
+              Hardware status: <strong id="model-vram-hint">—</strong>
+            </p>
+
+            <div class="model-family-label">YOLOv8 — Stable · Proven</div>
+            <div class="model-card-grid" id="grid-v8"></div>
+
+            <div class="model-family-label" style="margin-top:16px">YOLO11 — Latest Architecture</div>
+            <div class="model-card-grid" id="grid-v11"></div>
+
+            <div style="margin-top:16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+              <span style="font-size:12px;color:var(--text-muted);font-weight:600">Custom model path / name:</span>
+              <input class="form-input" id="custom-model-input" placeholder="e.g. yolov8n.pt or D:\models\custom.pt"
+                style="flex:1;min-width:200px" oninput="onCustomModelInput()"/>
+            </div>
+          </div>
+        </div>
+
+        <!-- Step 3: Training Parameters -->
+        <div class="setup-step" id="step-params" style="margin-top:14px">
+          <div class="step-header">
+            <div class="step-num" id="stepnum-3">3</div>
+            <div class="step-title">Training Parameters</div>
+            <div style="flex:1"></div>
+            <div class="preset-row" style="margin:0">
+              <label>Preset:</label>
+              <button class="btn btn-secondary btn-sm" onclick="loadPreset('fast')">&#9889; Fast CPU Test</button>
+              <button class="btn btn-secondary btn-sm" onclick="loadPreset('optimal')">&#127919; Optimal CPU (416px)</button>
+              <button class="btn btn-secondary btn-sm" onclick="loadPreset('highres')">&#128301; Standard CPU (640px)</button>
+            </div>
+          </div>
+          <div class="step-body">
+            <div class="params-grid">
+              <div class="param-group">
+                <label class="param-label">
+                  Epochs <span class="param-hint" data-tip="Total training iterations">?</span>
+                  <span class="param-ai-dot hidden" id="ai-dot-epochs">&#9733;</span>
+                  <span class="param-custom-dot hidden" id="custom-dot-epochs">&#9998;</span>
+                </label>
+                <input class="form-input" type="number" id="p-epochs" value="100" min="1" max="1000" oninput="onParamChange('epochs')"/>
+              </div>
+              <div class="param-group">
+                <label class="param-label">
+                  Batch Size <span class="param-hint" data-tip="Images per step">?</span>
+                  <span class="param-ai-dot hidden" id="ai-dot-batch">&#9733;</span>
+                  <span class="param-custom-dot hidden" id="custom-dot-batch">&#9998;</span>
+                </label>
+                <input class="form-input" type="number" id="p-batch" value="16" min="-1" max="256" oninput="onParamChange('batch')"/>
+              </div>
+              <div class="param-group">
+                <label class="param-label">
+                  Image Size
+                  <span class="param-ai-dot hidden" id="ai-dot-imgsz">&#9733;</span>
+                  <span class="param-custom-dot hidden" id="custom-dot-imgsz">&#9998;</span>
+                </label>
+                <select class="form-select" id="p-imgsz" onchange="onParamChange('imgsz')">
+                  <option value="320">320 px (Fastest CPU)</option>
+                  <option value="416" selected>416 px (Optimal CPU balance)</option>
+                  <option value="640">640 px (Standard)</option>
+                  <option value="960">960 px</option>
+                  <option value="1280">1280 px (High-res)</option>
+                </select>
+              </div>
+              <div class="param-group">
+                <label class="param-label">
+                  Patience <span class="param-hint" data-tip="Early stopping — epochs with no improvement">?</span>
+                  <span class="param-ai-dot hidden" id="ai-dot-patience">&#9733;</span>
+                  <span class="param-custom-dot hidden" id="custom-dot-patience">&#9998;</span>
+                </label>
+                <input class="form-input" type="number" id="p-patience" value="50" min="1" max="300" oninput="onParamChange('patience')"/>
+              </div>
+              <div class="param-group">
+                <label class="param-label">
+                  Learning Rate (lr0)
+                  <span class="param-ai-dot hidden" id="ai-dot-lr0">&#9733;</span>
+                  <span class="param-custom-dot hidden" id="custom-dot-lr0">&#9998;</span>
+                </label>
+                <input class="form-input" type="number" id="p-lr0" value="0.01" step="0.001" min="0.00001" max="0.1" oninput="onParamChange('lr0')"/>
+              </div>
+              <div class="param-group">
+                <label class="param-label">
+                  Optimizer
+                  <span class="param-ai-dot hidden" id="ai-dot-optimizer">&#9733;</span>
+                  <span class="param-custom-dot hidden" id="custom-dot-optimizer">&#9998;</span>
+                </label>
+                <select class="form-select" id="p-optimizer" onchange="onParamChange('optimizer')">
+                  <option value="SGD" selected>SGD</option>
+                  <option value="Adam">Adam</option>
+                  <option value="AdamW">AdamW</option>
+                  <option value="auto">Auto</option>
+                </select>
+              </div>
+              <div class="param-group">
+                <label class="param-label">
+                  Workers <span class="param-hint" data-tip="Dataloader threads — match to CPU cores">?</span>
+                  <span class="param-ai-dot hidden" id="ai-dot-workers">&#9733;</span>
+                  <span class="param-custom-dot hidden" id="custom-dot-workers">&#9998;</span>
+                </label>
+                <input class="form-input" type="number" id="p-workers" value="2" min="0" max="16" oninput="onParamChange('workers')"/>
+              </div>
+              <div class="param-group">
+                <label class="param-label">
+                  Device <span class="param-hint" data-tip="cpu = CPU training, 0 = GPU 0">?</span>
+                  <span class="param-ai-dot hidden" id="ai-dot-device">&#9733;</span>
+                  <span class="param-custom-dot hidden" id="custom-dot-device">&#9998;</span>
+                </label>
+                <input class="form-input" id="p-device" value="cpu" placeholder="cpu" oninput="onParamChange('device')"/>
+              </div>
+            </div>
+
+            <!-- Advanced toggle -->
+            <div class="params-advanced">
+              <div class="params-advanced-toggle" onclick="toggleAdvanced()" id="advanced-toggle">
+                <span id="advanced-arrow">&#9654;</span> Advanced Parameters
+              </div>
+              <div class="params-grid hidden" id="advanced-params">
+                <div class="param-group">
+                  <label class="param-label">Cosine LR</label>
+                  <select class="form-select" id="p-cos-lr">
+                    <option value="false" selected>Disabled</option>
+                    <option value="true">Enabled</option>
+                  </select>
+                </div>
+                <div class="param-group">
+                  <label class="param-label">Warmup Epochs</label>
+                  <input class="form-input" type="number" id="p-warmup" value="3.0" step="0.5" min="0" max="10"/>
+                </div>
+                <div class="param-group">
+                  <label class="param-label">Weight Decay</label>
+                  <input class="form-input" type="number" id="p-wd" value="0.0005" step="0.0001" min="0" max="0.01"/>
+                </div>
+                <div class="param-group">
+                  <label class="param-label">Mosaic Augmentation</label>
+                  <input class="form-input" type="number" id="p-mosaic" value="1.0" step="0.1" min="0" max="1"/>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Warning Box (auto-appears above launch button) -->
+        <div class="warning-box hidden" id="warning-box">
+          <div class="warning-box-header">
+            <span>&#9888; Training Parameter Warnings</span>
+            <span class="warning-count-badge" id="warning-count-badge">0</span>
+          </div>
+          <div class="warning-box-body" id="warning-box-body"></div>
+          <div class="warning-box-footer">You may still begin training — these are suggestions only.</div>
+        </div>
+
+        <!-- Launch zone -->
+        <div class="launch-zone" style="margin-top:16px">
+          <div class="run-name-row">
+            <label class="run-name-label" for="run-name-input">
+              Run Name <span style="color:var(--text-muted);font-weight:400;font-size:10px">(optional)</span>
+            </label>
+            <input class="form-input run-name-input" id="run-name-input" placeholder="Auto-generated if blank"/>
+          </div>
+          <button class="btn-launch" id="btn-launch" onclick="beginTraining()" disabled>
+            &#128640; Begin Training
+          </button>
+          <div style="font-size:12px;color:var(--text-muted);text-align:center;max-width:300px" id="launch-hint">
+            Select a dataset and model to enable training
+          </div>
+        </div>
+
+      </div><!-- /setup-container -->
+
+      <!-- ══════════════════════════════════════════════════════════════
+           PHASE 2: Training Console
+           ══════════════════════════════════════════════════════════════ -->
+      <div class="console-container hidden" id="console-container">
+        <div class="log-panel">
+          <div class="log-panel-header">
+            <div class="log-title">
+              <span style="color:var(--green)">&#9679;</span>
+              Training Console
+            </div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--text-muted);cursor:pointer">
+                <input type="checkbox" id="autoscroll-chk" checked onchange="setAutoScroll(this.checked)"/> Auto-scroll
+              </label>
+              <button class="btn btn-ghost btn-sm" onclick="clearLog()">Clear</button>
+            </div>
+          </div>
+          <div class="log-terminal" id="log-terminal"></div>
+        </div>
+
+        <div class="stats-panel">
+
+          <div class="stats-card">
+            <div class="stats-card-header">&#128200; Epoch Progress</div>
+            <div class="stats-card-body">
+              <div class="epoch-counter" style="display:flex;justify-content:space-between;align-items:flex-end;">
+                <div style="display:flex;align-items:baseline;gap:6px;">
+                  <div class="ep-current" id="sc-epoch">0</div>
+                  <div class="ep-sep">/</div>
+                  <div class="ep-total" id="sc-total">0</div>
+                </div>
+                <div style="font-size:12px;color:var(--text-muted);padding-bottom:4px;">
+                  Best: <span id="sc-best-epoch" style="color:var(--green);font-weight:bold;">—</span>
+                </div>
+              </div>
+              <div class="progress-bar">
+                <div class="progress-fill" id="sc-fill" style="width:0%"></div>
+              </div>
+              <!-- ETA row in stats panel -->
+              <div class="eta-row hidden" id="eta-row">
+                <span class="eta-label">Est. remaining</span>
+                <span class="eta-value" id="sc-eta">—</span>
+              </div>
+              <div class="epoch-metrics-row">
+                <div class="epoch-metric">
+                  <div class="em-label">mAP50</div>
+                  <div class="em-value" id="sc-map50" style="color:var(--green)">—</div>
+                </div>
+                <div class="epoch-metric">
+                  <div class="em-label">mAP50-95</div>
+                  <div class="em-value" id="sc-map5095" style="color:var(--blue)">—</div>
+                </div>
+                <div class="epoch-metric">
+                  <div class="em-label">Box Loss</div>
+                  <div class="em-value" id="sc-boxloss" style="color:var(--orange)">—</div>
+                </div>
+                <div class="epoch-metric">
+                  <div class="em-label">LR</div>
+                  <div class="em-value" id="sc-lr" style="color:var(--accent-light)">—</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="stats-card">
+            <div class="stats-card-header">
+              <span style="color:var(--green)">&#9635;</span> Accuracy Trend
+              <span style="margin-left:auto;font-family:'JetBrains Mono',monospace;color:var(--green);font-size:12px;font-weight:700" id="chart-map50-val">—</span>
+            </div>
+            <div class="stats-card-body" style="padding:10px 14px">
+              <div class="chart-legend-row">
+                <span class="chart-legend-dot" style="background:var(--green)"></span><span>mAP50</span>
+                <span class="chart-legend-dot" style="background:var(--blue);margin-left:10px"></span><span>mAP50-95</span>
+              </div>
+              <div class="chart-canvas-wrap">
+                <canvas id="chart-map50" width="300" height="90"></canvas>
+              </div>
+              <div class="chart-detail-row">
+                <div class="chart-detail-item"><span class="cd-label">mAP50</span><span class="cd-value" id="chart-map50-val2" style="color:var(--green)">—</span></div>
+                <div class="chart-detail-item"><span class="cd-label">mAP50-95</span><span class="cd-value" id="chart-map5095-val" style="color:var(--blue)">—</span></div>
+                <div class="chart-detail-item"><span class="cd-label">Precision</span><span class="cd-value" id="chart-prec-val">—</span></div>
+                <div class="chart-detail-item"><span class="cd-label">Recall</span><span class="cd-value" id="chart-rec-val">—</span></div>
+              </div>
+              <div class="chart-minmax-row">
+                <span>Best: <span id="chart-map50-best" style="color:var(--green);font-weight:700">—</span></span>
+                <span>&#916; last 5: <span id="chart-map50-delta">—</span></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="stats-card">
+            <div class="stats-card-header">
+              <span style="color:var(--orange)">&#9635;</span> Loss Trend
+              <span style="margin-left:auto;font-family:'JetBrains Mono',monospace;color:var(--orange);font-size:12px;font-weight:700" id="chart-loss-val">—</span>
+            </div>
+            <div class="stats-card-body" style="padding:10px 14px">
+              <div class="chart-legend-row">
+                <span class="chart-legend-dot" style="background:var(--orange)"></span><span>Box</span>
+                <span class="chart-legend-dot" style="background:var(--accent-light);margin-left:10px"></span><span>Cls</span>
+                <span class="chart-legend-dot" style="background:var(--yellow);margin-left:10px"></span><span>DFL</span>
+              </div>
+              <div class="chart-canvas-wrap">
+                <canvas id="chart-loss" width="300" height="90"></canvas>
+              </div>
+              <div class="chart-detail-row">
+                <div class="chart-detail-item"><span class="cd-label">Box Loss</span><span class="cd-value" id="chart-box-val" style="color:var(--orange)">—</span></div>
+                <div class="chart-detail-item"><span class="cd-label">Cls Loss</span><span class="cd-value" id="chart-cls-val" style="color:var(--accent-light)">—</span></div>
+                <div class="chart-detail-item"><span class="cd-label">DFL Loss</span><span class="cd-value" id="chart-dfl-val" style="color:var(--yellow)">—</span></div>
+              </div>
+              <div class="chart-minmax-row">
+                <span>Best Box: <span id="chart-loss-best" style="color:var(--orange);font-weight:700">—</span></span>
+                <span>&#916; last 5: <span id="chart-loss-delta">—</span></span>
+              </div>
+            </div>
+          </div>
+
+          <div class="stats-card">
+            <div class="stats-card-header">&#128421; Hardware Usage</div>
+            <div class="stats-card-body" style="padding:10px 14px">
+              <div class="hw-bar-gauges" id="hw-gauges">
+                <div class="hw-bar-row">
+                  <div class="hw-bar-meta"><span class="hw-bar-label">CPU</span><span class="hw-bar-val" id="gauge-cpu-val">0%</span></div>
+                  <div class="hw-bar-track"><div class="hw-bar-fill hw-bar-cpu" id="gauge-cpu-fill" style="width:0%"></div></div>
+                  <div class="hw-bar-sub" id="gauge-cpu-sub">—</div>
+                </div>
+                <div class="hw-bar-row">
+                  <div class="hw-bar-meta"><span class="hw-bar-label">RAM</span><span class="hw-bar-val" id="gauge-ram-val">0%</span></div>
+                  <div class="hw-bar-track"><div class="hw-bar-fill hw-bar-ram" id="gauge-ram-fill" style="width:0%"></div></div>
+                  <div class="hw-bar-sub" id="gauge-ram-sub">—</div>
+                </div>
+                <div class="hw-bar-row">
+                  <div class="hw-bar-meta"><span class="hw-bar-label">GPU</span><span class="hw-bar-val" id="gauge-gpu-val">0%</span></div>
+                  <div class="hw-bar-track"><div class="hw-bar-fill hw-bar-gpu" id="gauge-gpu-fill" style="width:0%"></div></div>
+                  <div class="hw-bar-sub" id="gauge-gpu-sub">—&#176;C</div>
+                </div>
+                <div class="hw-bar-row">
+                  <div class="hw-bar-meta"><span class="hw-bar-label">VRAM</span><span class="hw-bar-val" id="gauge-vram-val">0%</span></div>
+                  <div class="hw-bar-track"><div class="hw-bar-fill hw-bar-vram" id="gauge-vram-fill" style="width:0%"></div></div>
+                  <div class="hw-bar-sub" id="gauge-vram-sub">—/— MB</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="stats-card stats-stop-card hidden" id="stats-stop-card">
+            <div class="stats-card-body" style="padding:10px 14px">
+              <button class="btn-stop-panel" id="btn-stop-panel" onclick="confirmStop()">&#9209; Stop Training</button>
+              <div style="font-size:10px;color:var(--text-muted);text-align:center;margin-top:6px">Current best weights will be preserved</div>
+            </div>
+          </div>
+
+          <div class="stats-card commentary-card">
+            <div class="stats-card-header">&#129302; Performance Analysis</div>
+            <div class="stats-card-body">
+              <div class="commentary-text" id="commentary-text" style="color:var(--text-muted);font-style:italic">Analysis will appear every 5 epochs…</div>
+              <div class="commentary-epoch hidden" id="commentary-epoch"></div>
+            </div>
+          </div>
+
+        </div>
+      </div><!-- /console-container -->
+
+      <!-- ══════════════════════════════════════════════════════════════
+           PHASE 3: Results
+           ══════════════════════════════════════════════════════════════ -->
+      <div class="results-container hidden" id="results-container">
+        <div class="results-header">
+          <h2>&#127881; Training Complete</h2>
+          <div style="font-size:13px;color:var(--text-secondary);margin-left:auto" id="results-session-tag"></div>
+        </div>
+        <div class="results-body">
+          <div>
+            <div style="font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-muted);margin-bottom:10px">Final Metrics</div>
+            <div class="result-stat-grid" id="result-stat-grid">
+              <div class="result-stat"><div class="rs-label">Best mAP50</div><div class="rs-value" id="res-map50">—</div></div>
+              <div class="result-stat"><div class="rs-label">mAP50-95</div><div class="rs-value" id="res-map5095">—</div></div>
+              <div class="result-stat"><div class="rs-label">Precision</div><div class="rs-value" id="res-prec">—</div></div>
+              <div class="result-stat"><div class="rs-label">Recall</div><div class="rs-value" id="res-rec">—</div></div>
+            </div>
+          </div>
+          <div>
+            <div style="font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-muted);margin-bottom:10px">Saved Model</div>
+            <div class="result-file-card">
+              <div style="font-size:13px;font-weight:600;color:var(--text-primary)">best.pt &#8594; models/</div>
+              <div class="result-file-path" id="res-model-path">—</div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <a id="res-download-btn" class="btn btn-success" href="#" download>&#8615; Download .pt</a>
+                <button class="btn btn-secondary" onclick="trainAnother()">&#128260; Train Another</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Saved Models Library -->
+      <div class="setup-step models-library" id="models-library" style="margin-top:4px">
+        <div class="step-header">
+          <div class="step-title">&#128450; Saved Models Library</div>
+          <button class="btn btn-ghost btn-sm" onclick="loadModelsLibrary()">&#8635; Refresh</button>
+        </div>
+        <div class="step-body" style="padding:14px 20px">
+          <div class="models-library-list" id="models-library-list">
+            <div class="text-muted text-sm" style="padding:12px;text-align:center">No models saved yet.</div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /training-content -->
+  </div><!-- /training-root -->
+
+  <div id="toast-container"></div>
+
+  <div class="modal-overlay hidden" id="modal-overlay" onclick="closeModal(event)">
+    <div class="modal" id="modal-box">
+      <div class="modal-title" id="modal-title"></div>
+      <div id="modal-body"></div>
+      <div class="modal-actions" id="modal-actions"></div>
+    </div>
+  </div>
+
+  <script src="/static/js/vendor/socket.io.min.js"></script>
+  <script src="/static/js/socket.js?v=2.0.0"></script>
+  <script src="/static/js/training.js?v=3.0.0"></script>
+</body>
+</html>

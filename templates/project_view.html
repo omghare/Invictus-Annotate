@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Project — Invictus Annotate</title>
+  <meta name="description" content="View your assigned images and annotation progress."/>
+  <link rel="stylesheet" href="/static/css/main.css"/>
+  <link rel="stylesheet" href="/static/css/dashboard.css"/>
+  <style>
+    .pv-wrap { max-width: 1200px; margin: 0 auto; padding: 0; }
+
+    .pv-header { margin-bottom: 24px; }
+    .pv-header .greeting { font-size: 1.4rem; font-weight: 700; margin-bottom: 4px; }
+    .pv-header .project-name { color: var(--text-accent); font-size: 1.4rem; font-weight: 700; }
+    .pv-header .subtitle { color: var(--text-secondary); margin-top: 4px; font-size: 13px; }
+
+    /* Real-time stat cards */
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; margin-bottom: 24px; }
+
+    /* ── Filter toggle buttons ──────────────────────────────────────── */
+    .filter-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+
+    .filter-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 14px;
+      border-radius: 100px;
+      border: 1px solid var(--border-strong);
+      background: var(--bg-elevated);
+      color: var(--text-secondary);
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 150ms ease;
+    }
+    .filter-btn:hover { border-color: var(--accent); color: var(--accent-light); }
+    .filter-btn.active {
+      background: var(--accent-dim);
+      border-color: rgba(124,109,255,0.4);
+      color: var(--accent-light);
+    }
+    .filter-btn .filter-count {
+      background: rgba(255,255,255,0.08);
+      padding: 1px 6px;
+      border-radius: 100px;
+      font-size: 10px;
+      font-weight: 700;
+    }
+    .filter-btn.active .filter-count {
+      background: rgba(124,109,255,0.25);
+    }
+
+    /* Image grid */
+    .img-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 14px; }
+
+    .pv-img-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      overflow: hidden;
+      cursor: pointer;
+      transition: all var(--t-base);
+      text-decoration: none;
+    }
+    .pv-img-card:hover { border-color: var(--accent); transform: translateY(-2px); box-shadow: var(--shadow); }
+
+    .pv-img-card .card-thumb {
+      width: 100%; aspect-ratio: 4/3;
+      background: var(--bg-elevated);
+      position: relative; overflow: hidden;
+    }
+    .pv-img-card .card-thumb img {
+      width: 100%; height: 100%; object-fit: cover; display: block;
+    }
+    .pv-img-card .card-thumb .state-badge-overlay {
+      position: absolute; top: 8px; right: 8px;
+    }
+
+    .pv-img-card .card-footer { padding: 10px 12px; }
+    .pv-img-card .card-name {
+      font-size: 11px; color: var(--text-secondary);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      margin-bottom: 4px;
+    }
+
+    /* ── Pagination controls ─────────────────────────────────────────── */
+    .pagination-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 28px;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
+    .per-page-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .per-page-btn {
+      padding: 5px 12px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border-strong);
+      background: var(--bg-elevated);
+      color: var(--text-secondary);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 150ms ease;
+    }
+    .per-page-btn:hover { border-color: var(--accent); color: var(--accent-light); }
+    .per-page-btn.active {
+      background: var(--accent-dim);
+      border-color: rgba(124,109,255,0.4);
+      color: var(--accent-light);
+    }
+
+    .page-nav {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .page-nav-btn {
+      width: 32px; height: 32px;
+      display: flex; align-items: center; justify-content: center;
+      border-radius: var(--radius);
+      border: 1px solid var(--border-strong);
+      background: var(--bg-elevated);
+      color: var(--text-secondary);
+      font-size: 14px;
+      cursor: pointer;
+      transition: all 150ms ease;
+    }
+    .page-nav-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent-light); }
+    .page-nav-btn:disabled { opacity: 0.35; cursor: default; }
+
+    .page-info {
+      font-size: 12px;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+    .page-info strong { color: var(--text-secondary); }
+
+    .section-title {
+      font-size: 11px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.08em; color: var(--text-muted);
+      margin-bottom: 14px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+
+    /* Empty state per filter */
+    .filter-empty {
+      grid-column: 1/-1;
+      padding: 60px 20px;
+      text-align: center;
+      color: var(--text-muted);
+    }
+    .filter-empty .fe-icon { font-size: 32px; margin-bottom: 12px; opacity: 0.4; }
+    .filter-empty .fe-msg { font-size: 14px; color: var(--text-secondary); }
+    .filter-empty .fe-sub { font-size: 12px; margin-top: 4px; color: var(--text-muted); }
+  </style>
+</head>
+<body>
+
+  <!-- Topbar -->
+  <header class="topbar">
+    <div class="topbar-brand">
+      <div class="logo-dot"></div>
+      Invictus Annotate
+    </div>
+    <div class="topbar-spacer"></div>
+    <div class="conn-indicator">
+      <div class="conn-dot" id="conn-dot"></div>
+      <span id="conn-label">Connecting</span>
+    </div>
+    <button class="btn btn-ghost btn-sm" onclick="IA.logout()">Sign out</button>
+  </header>
+
+  <div class="dash-layout">
+
+    <!-- Sidebar -->
+    <nav class="sidebar">
+      <a class="nav-item nav-home-item" href="/home" id="nav-home">
+        <span class="nav-icon">🏠</span> Home
+      </a>
+
+      <div id="pv-sidebar-links"></div>
+
+      <div style="flex:1"></div>
+      <div style="padding:10px;font-size:11px;color:var(--text-muted)">
+        <div id="pv-sidebar-user" style="font-weight:600;color:var(--text-secondary)"></div>
+        <div id="pv-sidebar-project" style="margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
+      </div>
+    </nav>
+
+    <!-- Main content -->
+    <main class="dash-main">
+      <div class="pv-wrap">
+
+        <!-- Breadcrumb -->
+        <nav class="breadcrumb">
+          <a href="/home">🏠 Home</a>
+          <span class="bc-sep">/</span>
+          <span id="bc-project-name" style="color:var(--text-secondary)">Project</span>
+        </nav>
+
+        <!-- Header -->
+        <div class="pv-header" style="display:flex; justify-content:space-between; align-items:flex-end; gap: 20px;">
+          <div>
+            <span class="greeting">Hello, <span id="username-display">…</span> 👋</span>
+            <div class="project-name" id="project-name-display">Loading project…</div>
+            <div class="subtitle" id="project-subtitle">Your assigned images are shown below.</div>
+          </div>
+          <button class="btn btn-primary" id="project-submit-all-btn" style="height:fit-content; font-weight:600; display:none;" onclick="submitAllAnnotated()">
+            ✓ Add All Annotated to Dataset
+          </button>
+        </div>
+
+        <!-- Stats -->
+        <div class="stats-grid" id="stats-grid">
+          <div class="stat-card" style="--stat-color:var(--text-muted)">
+            <div class="stat-value" id="stat-total">—</div>
+            <div class="stat-label">Total in Project</div>
+          </div>
+          <div class="stat-card" style="--stat-color:var(--blue)">
+            <div class="stat-value" id="stat-assigned">—</div>
+            <div class="stat-label">Assigned to Me</div>
+          </div>
+          <div class="stat-card" style="--stat-color:var(--yellow)">
+            <div class="stat-value" id="stat-unannotated">—</div>
+            <div class="stat-label">To Annotate</div>
+          </div>
+          <div class="stat-card" style="--stat-color:var(--orange)">
+            <div class="stat-value" id="stat-annotated">—</div>
+            <div class="stat-label">Annotated</div>
+          </div>
+          <div class="stat-card" style="--stat-color:var(--green)">
+            <div class="stat-value" id="stat-ready">—</div>
+            <div class="stat-label">Ready for Export</div>
+          </div>
+        </div>
+
+        <!-- Filter toggle bar -->
+        <div class="filter-bar">
+          <button class="filter-btn active" id="fb-all" onclick="setFilter('all')">
+            All Assigned
+            <span class="filter-count" id="fc-all">0</span>
+          </button>
+          <button class="filter-btn" id="fb-unannotated" onclick="setFilter('unannotated')">
+            ◎ To Annotate
+            <span class="filter-count" id="fc-unannotated">0</span>
+          </button>
+          <button class="filter-btn" id="fb-annotated" onclick="setFilter('annotated')">
+            ◉ Annotated
+            <span class="filter-count" id="fc-annotated">0</span>
+          </button>
+          <button class="filter-btn" id="fb-ready_for_export" onclick="setFilter('ready_for_export')">
+            ✓ Ready
+            <span class="filter-count" id="fc-ready">0</span>
+          </button>
+        </div>
+
+        <div class="section-title">
+          <span id="grid-title-label">Your Images</span>
+          <span id="img-count-label" style="font-size:12px;color:var(--text-muted);margin-left:auto;font-weight:normal;text-transform:none;"></span>
+        </div>
+
+        <!-- Image Grid -->
+        <div class="img-grid" id="img-grid">
+          <!-- Populated by JS -->
+        </div>
+
+        <!-- Pagination Bar -->
+        <div class="pagination-bar" id="pagination-bar">
+          <div class="per-page-row">
+            <span>Show:</span>
+            <button class="per-page-btn active" id="pp-50"  onclick="setPerPage(50)">50</button>
+            <button class="per-page-btn"        id="pp-100" onclick="setPerPage(100)">100</button>
+            <button class="per-page-btn"        id="pp-200" onclick="setPerPage(200)">200</button>
+          </div>
+
+          <div class="page-nav">
+            <button class="page-nav-btn" id="btn-prev" onclick="goPage(-1)" disabled>◀</button>
+            <span class="page-info">
+              Page <strong id="page-current">1</strong> of <strong id="page-total">1</strong>
+              &nbsp;·&nbsp; <strong id="total-count">0</strong> images
+            </span>
+            <button class="page-nav-btn" id="btn-next" onclick="goPage(1)">▶</button>
+          </div>
+        </div>
+
+      </div>
+    </main>
+  </div>
+
+  <div id="toast-container"></div>
+
+  <script src="/static/js/vendor/socket.io.min.js"></script>
+  <script src="/static/js/socket.js?v=2.0.0"></script>
+  <script src="/static/js/project_view.js?v=2.0.0"></script>
+</body>
+</html>

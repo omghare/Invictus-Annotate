@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Annotate — Invictus Annotate</title>
+  <link rel="stylesheet" href="/static/css/main.css"/>
+  <link rel="stylesheet" href="/static/css/annotate.css"/>
+</head>
+<body>
+  <div class="annotate-layout">
+
+    <!-- Top bar -->
+    <header class="ann-topbar">
+      <a href="#" class="back-btn" id="back-btn">← Project</a>
+      <span style="color:var(--border-strong)">|</span>
+      <span class="ann-filename" id="topbar-filename">Loading…</span>
+      <span id="save-status" class="save-status saved">● Saved</span>
+
+      <div class="ann-topbar-spacer"></div>
+
+      <!-- Connection -->
+      <div class="conn-indicator">
+        <div class="conn-dot" id="conn-dot"></div>
+        <span id="conn-label">Connecting</span>
+      </div>
+
+      <button class="submit-btn" id="submit-btn" disabled>✓ Add to Dataset</button>
+    </header>
+
+    <!-- Left: image list -->
+    <aside class="img-list-panel">
+      <div class="img-list-header">
+        <span>Images</span>
+        <span id="img-count" style="font-size:10px;color:var(--text-muted)"></span>
+      </div>
+      <div id="img-list"></div>
+      <div class="img-list-actions">
+        <button class="btn btn-primary btn-sm" id="submit-all-btn" style="width:100%; justify-content:center;" disabled>
+          ✓ Add All Annotated
+        </button>
+      </div>
+    </aside>
+
+    <!-- Center: canvas -->
+    <main class="canvas-area" id="canvas-area">
+      <canvas id="ann-canvas"></canvas>
+
+      <!-- Zoom controls -->
+      <div class="zoom-controls">
+        <button class="zoom-btn" id="zoom-out" title="Zoom out">−</button>
+        <span class="zoom-level" id="zoom-level">100%</span>
+        <button class="zoom-btn" id="zoom-in" title="Zoom in">+</button>
+        <button class="zoom-btn" id="zoom-fit" title="Fit image" style="font-size:12px">⊡</button>
+      </div>
+    </main>
+
+    <!-- Right: tools panel -->
+    <aside class="tool-panel">
+
+      <!-- Tools -->
+      <div class="tool-section">
+        <div class="tool-section-title">Tools</div>
+        <div class="shortcut-grid">
+          <button class="shortcut-btn" id="shortcut-draw" data-tip="Draw bounding box">
+            <span class="kb">B</span> Draw
+          </button>
+          <button class="shortcut-btn" id="shortcut-last" data-tip="Select last box">
+            <span class="kb">D</span> Last box
+          </button>
+          <button class="shortcut-btn" id="shortcut-copy" data-tip="Copy prev image boxes">
+            <span class="kb">R</span> Copy prev
+          </button>
+          <button class="shortcut-btn" id="shortcut-del" data-tip="Delete selected box">
+            <span class="kb">Del</span> Delete
+          </button>
+          <button class="shortcut-btn" id="shortcut-undo" data-tip="Undo">
+            <span class="kb">⌃Z</span> Undo
+          </button>
+          <button class="shortcut-btn" id="shortcut-prev" data-tip="Previous image">
+            <span class="kb">S/←</span> Prev
+          </button>
+          <button class="shortcut-btn" id="shortcut-next" data-tip="Next image">
+            <span class="kb">F/→</span> Next
+          </button>
+          <button class="shortcut-btn" id="shortcut-save" data-tip="Force save"
+                  onclick="IA._forceSave?.()">
+            <span class="kb">⌃S</span> Save
+          </button>
+        </div>
+        <div class="mt-8" style="font-size:10px;color:var(--text-muted);line-height:1.7">
+          <b>Enter</b> — confirm box &nbsp;·&nbsp;
+          <b>Esc</b> — deselect<br>
+          <b>Scroll</b> — zoom &nbsp;·&nbsp;
+          <b>Space+drag</b> — pan
+        </div>
+      </div>
+
+      <!-- Classes -->
+      <div class="tool-section">
+        <div class="tool-section-title">Classes</div>
+        <div class="class-list" id="class-list">
+          <div style="color:var(--text-muted);font-size:12px">Loading…</div>
+        </div>
+      </div>
+
+      <!-- Bounding boxes -->
+      <div class="tool-section" style="flex:1">
+        <div class="tool-section-title">Boxes on this image</div>
+        <div class="box-list" id="box-list">
+          <div class="box-empty">No boxes yet.<br>Press <b>B</b> to draw.</div>
+        </div>
+      </div>
+
+    </aside>
+  </div>
+
+  <!-- Toast container -->
+  <div id="toast-container"></div>
+
+  <!-- Image ID from server -->
+  <script>
+    window.ANNOTATE_IMAGE_ID = "{{ image_id | default('') }}";
+    window.ANNOTATE_PROJECT_ID = "{{ project_id | default('') }}";
+  </script>
+
+  <!-- Socket.IO + IA utilities -->
+  <script src="/static/js/vendor/socket.io.min.js"></script>
+  <script src="/static/js/socket.js?v=2.0.0"></script>
+
+  <!-- Canvas engine -->
+  <script src="/static/js/annotate.js?v=2.0.0"></script>
+
+  <script>
+    // Update conn label on socket events
+    const origConnect = IA.connectSocket;
+    document.addEventListener('DOMContentLoaded', () => {
+      const dot   = document.getElementById('conn-dot');
+      const label = document.getElementById('conn-label');
+      if (dot && label) {
+        const observer = new MutationObserver(() => {
+          const connected = dot.classList.contains('connected');
+          label.textContent = connected ? 'Live' : 'Offline';
+        });
+        observer.observe(dot, { attributes: true });
+      }
+    });
+  </script>
+</body>
+</html>

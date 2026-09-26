@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Invictus Annotate — Login</title>
+  <meta name="description" content="Log in to Invictus Annotate, the LAN-based YOLO annotation tool."/>
+  <link rel="stylesheet" href="/static/css/main.css"/>
+  <style>
+    body { display:flex; align-items:center; justify-content:center; min-height:100vh; }
+
+    /* Animated background grid */
+    body::before {
+      content:'';
+      position:fixed; inset:0;
+      background-image:
+        linear-gradient(rgba(124,109,255,0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(124,109,255,0.03) 1px, transparent 1px);
+      background-size: 40px 40px;
+      pointer-events:none;
+    }
+
+    .login-wrap {
+      width:100%; max-width:380px;
+      padding:20px;
+      animation: fade-in 400ms ease;
+    }
+
+    .login-logo {
+      text-align:center; margin-bottom:32px;
+    }
+    .login-logo .logo-mark {
+      width:56px; height:56px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-light));
+      border-radius:16px;
+      display:inline-flex; align-items:center; justify-content:center;
+      font-size:24px; margin-bottom:12px;
+      box-shadow: 0 8px 32px var(--accent-glow);
+    }
+    .login-logo h1 { font-size:1.4rem; margin-bottom:4px; }
+    .login-logo p  { color:var(--text-secondary); font-size:13px; }
+
+    .login-card {
+      background:var(--bg-surface);
+      border:1px solid var(--border);
+      border-radius:var(--radius-xl);
+      padding:28px;
+      box-shadow:var(--shadow-lg);
+    }
+
+    .login-card .form-group + .form-group { margin-top:16px; }
+
+    .login-btn {
+      width:100%; margin-top:24px;
+      padding:11px; font-size:15px;
+      border-radius:var(--radius-lg);
+      border:none; cursor:pointer;
+      background:linear-gradient(135deg, var(--accent), var(--accent-light));
+      color:#fff; font-weight:600;
+      letter-spacing:0.01em;
+      transition:all var(--t-base);
+      display:flex; align-items:center; justify-content:center; gap:8px;
+    }
+    .login-btn:hover { transform:translateY(-1px); box-shadow:var(--shadow-accent); }
+    .login-btn:active{ transform:translateY(0); }
+    .login-btn:disabled { opacity:0.5; pointer-events:none; }
+
+    .login-error {
+      background:var(--red-d);
+      border:1px solid rgba(255,95,126,0.3);
+      color:var(--red);
+      border-radius:var(--radius);
+      padding:10px 14px;
+      font-size:13px;
+      margin-top:14px;
+      display:none;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-wrap">
+    <div class="login-logo">
+      <div class="logo-mark">🎯</div>
+      <h1>Invictus Annotate</h1>
+      <p>LAN Bounding Box Annotation Tool</p>
+    </div>
+
+    <div class="login-card">
+      <div class="form-group">
+        <label class="form-label" for="username">Username</label>
+        <input class="form-input" id="username" type="text"
+               placeholder="Enter username" autocomplete="username" autofocus/>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="password">Password</label>
+        <input class="form-input" id="password" type="password"
+               placeholder="Enter password" autocomplete="current-password"/>
+      </div>
+
+      <div class="login-error" id="login-error"></div>
+
+      <button class="login-btn" id="login-btn">
+        <span id="btn-text">Sign In</span>
+        <span id="btn-spinner" class="spinner hidden" style="width:16px;height:16px;border-width:2px;"></span>
+      </button>
+    </div>
+  </div>
+
+  <div id="toast-container"></div>
+
+  <script>
+    // Redirect if already logged in
+    const token = localStorage.getItem('ia_token');
+    if (token) {
+      const payload = JSON.parse(atob(token.split('.')[1]));
+      if (payload.exp * 1000 > Date.now()) {
+        window.location.href = payload.is_admin ? '/dashboard' : '/project';
+      }
+    }
+
+    const form   = document.getElementById('login-btn');
+    const errEl  = document.getElementById('login-error');
+    const spinner= document.getElementById('btn-spinner');
+    const btnTxt = document.getElementById('btn-text');
+
+    async function doLogin() {
+      const username = document.getElementById('username').value.trim();
+      const password = document.getElementById('password').value;
+      if (!username || !password) { showError('Please enter username and password.'); return; }
+
+      form.disabled = true;
+      spinner.classList.remove('hidden');
+      btnTxt.textContent = 'Signing in…';
+      errEl.style.display = 'none';
+
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ username, password }),
+        });
+        const data = await res.json();
+        if (!res.ok) { showError(data.detail || 'Login failed'); return; }
+
+        localStorage.setItem('ia_token', data.access_token);
+        localStorage.setItem('ia_user',  JSON.stringify({
+          id: data.user_id, username: data.username, is_admin: data.is_admin,
+        }));
+
+        window.location.href = data.is_admin ? '/dashboard' : '/project';
+      } catch (e) {
+        showError('Network error — is the server running?');
+      } finally {
+        form.disabled = false;
+        spinner.classList.add('hidden');
+        btnTxt.textContent = 'Sign In';
+      }
+    }
+
+    function showError(msg) {
+      errEl.textContent = msg;
+      errEl.style.display = 'block';
+    }
+
+    form.addEventListener('click', doLogin);
+    document.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+  </script>
+</body>
+</html>

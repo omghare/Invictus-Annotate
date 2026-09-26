@@ -1,0 +1,27 @@
+python -c "import torch; print(torch.__version__)"
+2.12.0.dev20260326+cu128
+
+
+latest prompt(1.7.2026) - 
+now - 
+i clicked on that button "Add All Annotated to Dataset", 
+first of it it should be "Add All Annotated Images to Dataset", fix it.
+when i click on that button it says "method not allowed". analyse why and fix it. 
+that annotated counter is still not moving btw, fix it.
+
+
+latest prompt after implementation plan(2.7.2026, 12:14)
+should i myself shift all that dataset folder like this - 
+move all the images from that folder to dataset/some_project_name so that we have this dataset as main folder in which multiple subfolders can have their own datasets? it would be easier imo.
+
+
+
+
+
+Things to do - 
+
+Adding video to frames page before "Import Images" page.
+
+Adding Models
+
+

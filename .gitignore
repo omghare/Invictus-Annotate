@@ -1,0 +1,129 @@
+# ==============================================================================
+# Invictus Annotate - .gitignore
+# ==============================================================================
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# C extensions / build artifacts
+*.obj
+*.o
+*.pyd
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+venv*/
+env/
+env*/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment Variables & Secrets
+.env
+.env.local
+.env.*.local
+*.env
+!.env.example
+!.env.template
+
+# Local Database & SQLite files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Deep Learning / YOLO Model Weights
+*.pt
+*.pth
+*.onnx
+*.engine
+*.tflite
+*.mlpackage
+*.torchscript
+*.bin
+*.weights
+models/*
+!models/.gitkeep
+
+# YOLO / Ultralytics Training Runs & Outputs
+runs/
+training_runs/
+
+# Datasets, Annotations, Raw & Extracted Media
+dataset/
+Test_Dataset/
+extracted_frames/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Logs and runtime artifacts
+*.log
+logs/
+*.pid
+*.seed
+*.crashdump
+
+# Testing and Code Quality
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# Operating System Files
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Temporary files & caches
+tmp/
+temp/
+*.tmp

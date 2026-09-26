@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ProCut — Video Editor</title>
+  <meta name="description" content="Lossless Video Cutter via FFmpeg" />
+  <link rel="stylesheet" href="/static/css/main.css" />
+  <link rel="stylesheet" href="/static/css/video_processor.css" />
+</head>
+
+<body>
+  <!-- Topbar -->
+  <header class="topbar">
+    <div class="topbar-brand">
+      <div class="logo-dot" style="background-color: #007acc;"></div>
+      ProCut - Video Editor
+    </div>
+    <div class="topbar-spacer"></div>
+    <div class="topbar-actions">
+      <button class="btn btn-ghost" onclick="window.close()" title="Close Tab">✖ Close</button>
+    </div>
+  </header>
+
+  <main class="vp-container">
+    <!-- Video Player Section -->
+    <div class="vp-video-section">
+      <video id="video-player" controls preload="metadata">
+        Your browser does not support the video tag.
+      </video>
+    </div>
+
+    <!-- Timeline Layout -->
+    <div class="vp-timeline">
+      <span id="lbl-current-time" class="time-label">00:00:00.00</span>
+      <div class="timeline-wrapper">
+        <div class="timeline-highlight" id="timeline-highlight"></div>
+        <div class="timeline-marker" id="marker-start" style="display: none;"></div>
+        <div class="timeline-marker" id="marker-end" style="display: none;"></div>
+        <input type="range" id="video-slider" min="0" max="100" value="0" step="0.01">
+      </div>
+      <span id="lbl-total-time" class="time-label">00:00:00.00</span>
+    </div>
+
+    <!-- Bottom Panel -->
+    <div class="vp-bottom-panel">
+      <!-- Controls Panel -->
+      <fieldset class="vp-group">
+        <legend>Timeline Controls</legend>
+
+        <div class="vp-row">
+          <input type="text" id="import-path" class="form-input" placeholder="Click 'Select Video' to choose..."
+            readonly style="flex:1" />
+          <button id="btn-pick" class="btn btn-secondary" onclick="pickImportFile()">📁 Select Video</button>
+          <button id="btn-import" class="btn btn-primary" onclick="loadVideo()">Import Video</button>
+        </div>
+
+        <div class="vp-row" style="margin-top: 10px;">
+          <button id="btn-play" class="btn btn-secondary" onclick="togglePlay()" disabled>Play / Pause</button>
+          <button id="btn-set-start" class="btn btn-secondary" onclick="setStartTime()" disabled>Set In-Point
+            [Start]</button>
+          <button id="btn-set-end" class="btn btn-secondary" onclick="setEndTime()" disabled>Set Out-Point
+            [End]</button>
+        </div>
+
+        <div class="vp-export-row">
+          <div class="vp-export-labels">
+            <span id="lbl-start-time" class="time-label">Start: --:--:--.--</span>
+            <span id="lbl-end-time" class="time-label">End: --:--:--.--</span>
+          </div>
+          <button id="btn-export" class="btn btn-save" onclick="exportVideo()" disabled>Export Lossless Cut</button>
+        </div>
+      </fieldset>
+
+      <!-- Telemetry Panel -->
+      <fieldset class="vp-group">
+        <legend>Video Telemetry</legend>
+        <table class="vp-stats-table">
+          <thead>
+            <tr>
+              <th style="color: #aaaaaa;">Metric</th>
+              <th style="color: #aaaaaa;">Source Video</th>
+              <th style="color: #aaaaaa;">Exported Cut</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Frames Per Second:</td>
+              <td id="lbl-src-fps">N/A</td>
+              <td id="lbl-cut-fps">N/A</td>
+            </tr>
+            <tr>
+              <td>Resolution:</td>
+              <td id="lbl-src-res">N/A</td>
+              <td id="lbl-cut-res">N/A</td>
+            </tr>
+            <tr>
+              <td>Video Codec:</td>
+              <td id="lbl-src-codec">N/A</td>
+              <td id="lbl-cut-codec">N/A</td>
+            </tr>
+            <tr>
+              <td>Total Frame Count:</td>
+              <td id="lbl-src-frames">N/A</td>
+              <td id="lbl-cut-frames">N/A</td>
+            </tr>
+            <tr>
+              <td>Avg Size (First 5):</td>
+              <td id="lbl-src-size">N/A</td>
+              <td id="lbl-cut-size">N/A</td>
+            </tr>
+          </tbody>
+        </table>
+      </fieldset>
+    </div>
+  </main>
+
+  <script src="/static/js/api.js"></script>
+  <script src="/static/js/video_processor.js"></script>
+</body>
+
+</html>

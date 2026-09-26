@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Home — Invictus Annotate</title>
+  <meta name="description" content="Select a project to begin annotating your dataset."/>
+  <link rel="stylesheet" href="/static/css/main.css"/>
+  <link rel="stylesheet" href="/static/css/home.css?v=2.1.0"/>
+</head>
+<body>
+
+  <!-- Topbar -->
+  <header class="topbar">
+    <div class="topbar-brand">
+      <div class="logo-dot"></div>
+      Invictus Annotate
+      <span id="topbar-role-badge" style="display:none;font-size:10px;background:var(--accent-dim);color:var(--accent-light);padding:2px 7px;border-radius:100px;font-weight:600"></span>
+    </div>
+    <div class="topbar-spacer"></div>
+    <div class="conn-indicator">
+      <div class="conn-dot" id="conn-dot"></div>
+      <span id="conn-label">Connecting</span>
+    </div>
+    <button class="btn btn-ghost btn-sm" onclick="IA.logout()">Sign out</button>
+  </header>
+
+  <div class="home-wrap">
+
+    <!-- Sidebar -->
+    <nav class="home-sidebar">
+      <a class="nav-item active" href="/home" id="nav-home">
+        <span class="nav-icon">🏠</span> Home
+      </a>
+
+      <!-- Admin only sections shown when a project is opened -->
+      <div id="sidebar-admin-section" style="display:none">
+        <div class="sidebar-section-label">Current Project</div>
+        <div id="sidebar-project-name" style="padding:4px 10px;font-size:12px;color:var(--text-secondary);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">—</div>
+      </div>
+
+      <div style="flex:1"></div>
+      <div style="padding:10px;font-size:11px;color:var(--text-muted)">
+        <div id="sidebar-username" style="font-weight:600;color:var(--text-secondary)"></div>
+        <div style="margin-top:2px">Invictus Annotate v2</div>
+      </div>
+    </nav>
+
+    <!-- Main content -->
+    <main class="home-main">
+
+      <!-- Welcome header -->
+      <div class="home-header">
+        <div class="home-greeting">
+          Welcome back, <span class="greeting-name" id="greeting-name">…</span> 👋
+        </div>
+        <div class="home-subtitle" id="home-subtitle">Select a project to start annotating</div>
+      </div>
+
+      <!-- Global quick stats (admin only) -->
+      <div class="home-quick-stats" id="global-stats-bar" style="display:none">
+        <div class="quick-stat">
+          <div class="quick-stat-icon">📁</div>
+          <div class="quick-stat-body">
+            <div class="quick-stat-val" id="qs-projects">—</div>
+            <div class="quick-stat-lbl">Projects</div>
+          </div>
+        </div>
+        <div class="quick-stat">
+          <div class="quick-stat-icon">🖼️</div>
+          <div class="quick-stat-body">
+            <div class="quick-stat-val" id="qs-images">—</div>
+            <div class="quick-stat-lbl">Total Images</div>
+          </div>
+        </div>
+        <div class="quick-stat">
+          <div class="quick-stat-icon">✅</div>
+          <div class="quick-stat-body">
+            <div class="quick-stat-val" id="qs-annotated">—</div>
+            <div class="quick-stat-lbl">Annotated</div>
+          </div>
+        </div>
+        <div class="quick-stat">
+          <div class="quick-stat-icon">📦</div>
+          <div class="quick-stat-body">
+            <div class="quick-stat-val" id="qs-exported">—</div>
+            <div class="quick-stat-lbl">Exported</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Projects section -->
+      <div class="section-row">
+        <span class="section-heading" id="projects-section-heading">Your Projects</span>
+        <div style="display:flex; gap:10px;">
+          <!-- Admin only: Project History button -->
+          <button class="btn btn-secondary btn-sm" id="project-history-btn" style="display:none" onclick="openProjectHistoryModal()">
+            📋 Project History
+          </button>
+          <!-- Admin only: New Project button -->
+          <button class="btn btn-primary btn-sm" id="new-project-btn" style="display:none" onclick="openNewProjectModal()">
+            + New Project
+          </button>
+        </div>
+      </div>
+
+      <!-- Project cards grid -->
+      <div class="projects-grid" id="projects-grid">
+        <!-- Skeleton loaders shown while fetching -->
+        <div class="skeleton-card">
+          <div class="skeleton-thumb"></div>
+          <div class="skeleton-body">
+            <div class="skeleton-line med"></div>
+            <div class="skeleton-line short"></div>
+          </div>
+        </div>
+        <div class="skeleton-card">
+          <div class="skeleton-thumb"></div>
+          <div class="skeleton-body">
+            <div class="skeleton-line med"></div>
+            <div class="skeleton-line short"></div>
+          </div>
+        </div>
+        <div class="skeleton-card">
+          <div class="skeleton-thumb"></div>
+          <div class="skeleton-body">
+            <div class="skeleton-line med"></div>
+            <div class="skeleton-line short"></div>
+          </div>
+        </div>
+      </div>
+
+    </main>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast-container"></div>
+
+  <!-- New Project Modal -->
+  <div class="modal-overlay hidden" id="modal-overlay" onclick="closeModal(event)">
+    <div class="modal" id="modal-box">
+      <div class="modal-title" id="modal-title"></div>
+      <div id="modal-body"></div>
+      <div class="modal-actions" id="modal-actions"></div>
+    </div>
+  </div>
+
+  <script src="/static/js/vendor/socket.io.min.js"></script>
+  <script src="/static/js/socket.js?v=2.0.0"></script>
+  <script src="/static/js/home.js?v=2.1.0"></script>
+</body>
+</html>
