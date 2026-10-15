@@ -1,74 +1,42 @@
 """
 Project routes — multi-project support.
-All project endpoints are now scoped to /api/projects/{project_id}.
+All project endpoints are scoped to /api/projects/{project_id}.
 """
+import asyncio
 import json
-import os
 import shutil
+import sys
 from pathlib import Path
 from typing import List, Optional
 
 import aiosqlite
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from app.auth import get_admin_user, get_current_user, hash_password
+from app.auth import bump_token_version, get_admin_user, get_current_user, hash_password
+from app.common import STATES, chunks, get_accessible_project, get_project_or_404, project_stats
+from app.config import EXTRACTED_FRAMES_DIR, IMAGE_EXTS
 from app.database import get_db, new_id, now_iso
+from app.images import remove_thumbnails
 from app.models import (
     CreateProjectRequest, CreateUserRequest, ImportResult,
-    ProjectListItem, ProjectOut, UpdateClassesRequest, UserOut,
+    ProjectListItem, ProjectOut, SetPasswordRequest, UpdateClassesRequest, UserOut,
     ProjectHistoryItem,
 )
-from app.socket_manager import (
-    emit_global_projects_changed, emit_project_updated, emit_stats,
-)
-from app.config import DATASET_DIR
+from app.seq_utils import natural_key, seq_group_for
+from app.socket_manager import emit_global_projects_changed, emit_project_updated, emit_stats
 
 router = APIRouter(tags=["project"])
 
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
-
-async def _get_project_or_404(project_id: str, db: aiosqlite.Connection) -> dict:
-    cur = await db.execute("SELECT * FROM project WHERE id = ?", (project_id,))
-    row = await cur.fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Project not found")
-    d = dict(row)
-    d["classes"] = json.loads(d["classes"])
-    return d
-
-
-async def _project_stats(project_id: str, db: aiosqlite.Connection) -> dict:
-    cur = await db.execute(
-        "SELECT state, COUNT(*) AS cnt FROM images WHERE project_id = ? GROUP BY state",
-        (project_id,),
-    )
-    rows = await cur.fetchall()
-    counts = {r["state"]: r["cnt"] for r in rows}
-    total_cur = await db.execute(
-        "SELECT COUNT(*) AS cnt FROM images WHERE project_id = ?", (project_id,)
-    )
-    total_row = await total_cur.fetchone()
-    return {
-        "total":            total_row["cnt"],
-        "unassigned":       counts.get("unassigned", 0),
-        "assigned":         counts.get("assigned", 0),
-        "unannotated":      counts.get("unannotated", 0),
-        "annotated":        counts.get("annotated", 0),
-        "ready_for_export": counts.get("ready_for_export", 0),
-        "exported":         counts.get("exported", 0),
-    }
-
-
 async def _enrich_project(row: dict, db: aiosqlite.Connection) -> dict:
     """Add computed image-count stats to a project dict."""
-    stats = await _project_stats(row["id"], db)
-    row["image_count"]     = stats["total"]
-    row["annotated_count"] = stats["annotated"] + stats["ready_for_export"] + stats["exported"]
-    row["ready_count"]     = stats["ready_for_export"]
-    row["exported_count"]  = stats["exported"]
-    row["unassigned_count"]= stats["unassigned"]
+    stats = await project_stats(row["id"], db)
+    row["image_count"]      = stats["total"]
+    row["annotated_count"]  = stats["done"]
+    row["ready_count"]      = stats["ready_for_export"]
+    row["exported_count"]   = stats["exported"]
+    row["unassigned_count"] = stats["unassigned"]
     return row
 
 
@@ -79,14 +47,10 @@ async def list_projects(
     db: aiosqlite.Connection = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
-    """
-    Admin: sees all projects.
-    Annotator: sees only projects that have images assigned to them.
-    """
+    """Admin: sees all projects. Annotator: only projects with images assigned to them."""
     if user["is_admin"]:
         cur = await db.execute("SELECT * FROM project ORDER BY created_at DESC")
     else:
-        # Projects where this user has at least one image assigned
         cur = await db.execute("""
             SELECT DISTINCT p.*
             FROM project p
@@ -94,46 +58,29 @@ async def list_projects(
             WHERE i.assigned_to = ?
             ORDER BY p.created_at DESC
         """, (user["id"],))
-
     rows = await cur.fetchall()
     if not rows:
         return []
 
-    # Batch query image counts per project & state in ONE query instead of N*2 queries
-    stats_cur = await db.execute("""
-        SELECT project_id, state, COUNT(*) AS cnt
-        FROM images
-        GROUP BY project_id, state
-    """)
-    stats_rows = await stats_cur.fetchall()
-
-    project_stats_map = {}
-    for r in stats_rows:
-        pid = r["project_id"]
-        st = r["state"]
-        cnt = r["cnt"]
-        if pid not in project_stats_map:
-            project_stats_map[pid] = {
-                "total": 0, "unassigned": 0, "assigned": 0,
-                "unannotated": 0, "annotated": 0, "ready_for_export": 0, "exported": 0
-            }
-        project_stats_map[pid][st] = cnt
-        project_stats_map[pid]["total"] += cnt
+    # One grouped query for all projects' counts
+    stats_cur = await db.execute(
+        "SELECT project_id, state, COUNT(*) AS cnt FROM images GROUP BY project_id, state"
+    )
+    per_project: dict[str, dict] = {}
+    for r in await stats_cur.fetchall():
+        per_project.setdefault(r["project_id"], {})[r["state"]] = r["cnt"]
 
     result = []
     for row in rows:
         d = dict(row)
         d["classes"] = json.loads(d["classes"])
-        pid = d["id"]
-        stats = project_stats_map.get(pid, {
-            "total": 0, "unassigned": 0, "assigned": 0,
-            "unannotated": 0, "annotated": 0, "ready_for_export": 0, "exported": 0
-        })
-        d["image_count"]      = stats["total"]
-        d["annotated_count"]  = stats["annotated"] + stats["ready_for_export"] + stats["exported"]
-        d["ready_count"]      = stats["ready_for_export"]
-        d["exported_count"]   = stats["exported"]
-        d["unassigned_count"] = stats["unassigned"]
+        c = per_project.get(d["id"], {})
+        d["image_count"]      = sum(c.values())
+        d["annotated_count"]  = c.get("annotated", 0) + c.get("ready_for_export", 0) + c.get("exported", 0)
+        d["ready_count"]      = c.get("ready_for_export", 0)
+        d["exported_count"]   = c.get("exported", 0)
+        d["unassigned_count"] = c.get("unassigned", 0)
+        d["stats"]            = {s: c.get(s, 0) for s in STATES}
         result.append(ProjectListItem(**d))
     return result
 
@@ -155,17 +102,12 @@ async def create_project(
     await db.execute(
         "INSERT INTO project_history (id, project_id, name, date_created, dataset_size, date_deleted) "
         "VALUES (?, ?, ?, ?, 0, NULL)",
-        (new_id(), pid, body.name.strip(), created_at)
+        (new_id(), pid, body.name.strip(), created_at),
     )
     await db.commit()
-
     await emit_global_projects_changed()
-
-    cur = await db.execute("SELECT * FROM project WHERE id = ?", (pid,))
-    row = dict(await cur.fetchone())
-    row["classes"] = json.loads(row["classes"])
-    row = await _enrich_project(row, db)
-    return ProjectOut(**row)
+    row = await get_project_or_404(pid, db)
+    return ProjectOut(**await _enrich_project(row, db))
 
 
 # ── Project History ──────────────────────────────────────────────────────────
@@ -175,22 +117,17 @@ async def get_project_history(
     db: aiosqlite.Connection = Depends(get_db),
     _admin: dict = Depends(get_admin_user),
 ):
-    query = """
-        SELECT 
-            h.project_id,
-            h.name, 
-            h.date_created, 
-            h.date_deleted,
-            CASE 
+    cur = await db.execute("""
+        SELECT
+            h.project_id, h.name, h.date_created, h.date_deleted,
+            CASE
                 WHEN h.date_deleted IS NOT NULL THEN h.dataset_size
                 ELSE (SELECT COUNT(*) FROM images i WHERE i.project_id = h.project_id)
-            END as dataset_size
+            END AS dataset_size
         FROM project_history h
         ORDER BY h.date_created DESC
-    """
-    cur = await db.execute(query)
-    rows = await cur.fetchall()
-    return [ProjectHistoryItem(**dict(r)) for r in rows]
+    """)
+    return [ProjectHistoryItem(**dict(r)) for r in await cur.fetchall()]
 
 
 # ── Get single project ────────────────────────────────────────────────────────
@@ -199,11 +136,10 @@ async def get_project_history(
 async def get_project(
     project_id: str,
     db: aiosqlite.Connection = Depends(get_db),
-    _user: dict = Depends(get_current_user),
+    user: dict = Depends(get_current_user),
 ):
-    d = await _get_project_or_404(project_id, db)
-    d = await _enrich_project(d, db)
-    return ProjectOut(**d)
+    d = await get_accessible_project(project_id, user, db)
+    return ProjectOut(**await _enrich_project(d, db))
 
 
 # ── Delete project ────────────────────────────────────────────────────────────
@@ -214,43 +150,47 @@ async def delete_project(
     db: aiosqlite.Connection = Depends(get_db),
     _admin: dict = Depends(get_admin_user),
 ):
-    proj = await _get_project_or_404(project_id, db)
-    project_name = proj["name"]
+    proj = await get_project_or_404(project_id, db)
 
-    # Count current images in the project
-    cur = await db.execute("SELECT COUNT(*) AS cnt FROM images WHERE project_id = ?", (project_id,))
-    img_count = (await cur.fetchone())["cnt"]
+    cur = await db.execute("SELECT id FROM images WHERE project_id = ?", (project_id,))
+    image_ids = [r["id"] for r in await cur.fetchall()]
 
-    # Mark as deleted in project_history
     now = now_iso()
     res = await db.execute(
         "UPDATE project_history SET date_deleted = ?, dataset_size = ? WHERE project_id = ?",
-        (now, img_count, project_id)
+        (now, len(image_ids), project_id),
     )
     if res.rowcount == 0:
         await db.execute(
             "INSERT INTO project_history (id, project_id, name, date_created, dataset_size, date_deleted) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (new_id(), project_id, project_name, proj["created_at"], img_count, now)
+            (new_id(), project_id, proj["name"], proj["created_at"], len(image_ids), now),
         )
 
-    # Cascade delete DB records: annotations → images → project
     await db.execute(
-        "DELETE FROM annotations WHERE image_id IN (SELECT id FROM images WHERE project_id = ?)",
-        (project_id,),
+        "DELETE FROM annotations WHERE image_id IN (SELECT id FROM images WHERE project_id = ?)", (project_id,)
     )
+    await db.execute(
+        "DELETE FROM annotation_batch_items WHERE batch_id IN "
+        "(SELECT id FROM annotation_batches WHERE project_id = ?)", (project_id,)
+    )
+    await db.execute("DELETE FROM annotation_batches WHERE project_id = ?", (project_id,))
+    await db.execute(
+        "DELETE FROM model_predictions WHERE job_id IN (SELECT id FROM jobs WHERE project_id = ?)", (project_id,)
+    )
+    await db.execute("DELETE FROM jobs WHERE project_id = ?", (project_id,))
     await db.execute("DELETE FROM images WHERE project_id = ?", (project_id,))
     await db.execute("DELETE FROM project WHERE id = ?", (project_id,))
     await db.commit()
 
-    # Clean up extracted frames folder for this project
-    extracted_frames_dir = DATASET_DIR / "extracted_frames" / project_id
-    if extracted_frames_dir.exists():
-        shutil.rmtree(extracted_frames_dir, ignore_errors=True)
+    # Frames this app extracted for the project are ours to delete; imported folders are not
+    frames_dir = EXTRACTED_FRAMES_DIR / project_id
+    if frames_dir.exists():
+        await asyncio.to_thread(shutil.rmtree, frames_dir, True)
+    await asyncio.to_thread(remove_thumbnails, image_ids)
 
     await emit_global_projects_changed()
     return {"detail": "Project deleted"}
-
 
 
 # ── Update classes ────────────────────────────────────────────────────────────
@@ -262,182 +202,252 @@ async def update_classes(
     db: aiosqlite.Connection = Depends(get_db),
     _admin: dict = Depends(get_admin_user),
 ):
-    await _get_project_or_404(project_id, db)
-
+    await get_project_or_404(project_id, db)
+    renames = {old: new.strip() for old, new in body.renames.items() if old != new.strip() and new.strip() in body.classes}
+    # Two passes through placeholder names, so swaps (a↔b) and chains (a→b→c) don't merge classes
+    scope = "AND image_id IN (SELECT id FROM images WHERE project_id = ?)"
+    for i, old in enumerate(renames):
+        await db.execute(f"UPDATE annotations SET class_name = ? WHERE class_name = ? {scope}",
+                         (f"\x00rename{i}", old, project_id))
+    for i, new in enumerate(renames.values()):
+        await db.execute(f"UPDATE annotations SET class_name = ? WHERE class_name = ? {scope}",
+                         (new, f"\x00rename{i}", project_id))
+    await db.execute("UPDATE project SET classes = ? WHERE id = ?", (json.dumps(body.classes), project_id))
+    # Keep stored class ids in step with the new order (names are the source of truth)
     await db.execute(
-        "UPDATE project SET classes = ? WHERE id = ?",
+        "UPDATE annotations SET class_id = COALESCE("
+        "  (SELECT CAST(j.key AS INTEGER) FROM json_each(?) j WHERE j.value = annotations.class_name), -1) "
+        "WHERE image_id IN (SELECT id FROM images WHERE project_id = ?)",
         (json.dumps(body.classes), project_id),
     )
     await db.commit()
+    await emit_project_updated(body.classes, project_id, renames)
+    r = await get_project_or_404(project_id, db)
+    return ProjectOut(**await _enrich_project(r, db))
 
-    # Notify annotators in this project
-    await emit_project_updated(body.classes, project_id)
 
-    cur = await db.execute("SELECT * FROM project WHERE id = ?", (project_id,))
-    r = dict(await cur.fetchone())
-    r["classes"] = json.loads(r["classes"])
-    r = await _enrich_project(r, db)
-    return ProjectOut(**r)
+@router.get("/projects/{project_id}/classes/usage")
+async def class_usage(
+    project_id: str,
+    db: aiosqlite.Connection = Depends(get_db),
+    user: dict = Depends(get_current_user),
+):
+    """Box count per class name (including orphans no longer in the class list)."""
+    await get_accessible_project(project_id, user, db)
+    cur = await db.execute(
+        "SELECT a.class_name, COUNT(*) AS boxes, COUNT(DISTINCT a.image_id) AS images "
+        "FROM annotations a JOIN images i ON i.id = a.image_id WHERE i.project_id = ? GROUP BY a.class_name",
+        (project_id,),
+    )
+    return {r["class_name"]: {"boxes": r["boxes"], "images": r["images"]} for r in await cur.fetchall()}
 
 
 # ── Import images ─────────────────────────────────────────────────────────────
 
 class ImportFolderRequest(BaseModel):
     folder_path: Optional[str] = None
+    include_subfolders: bool = False
+
+
+def _scan_folder(folder: Path, recursive: bool) -> tuple[list[tuple[Path, int, int]], int]:
+    """
+    Runs in a worker thread: list images (natural order per folder) and read their sizes.
+    Returns (found, unreadable_count).
+    """
+    from PIL import Image as PILImage
+
+    pattern = folder.rglob("*") if recursive else folder.iterdir()
+    files = [f for f in pattern if f.is_file() and f.suffix.lower() in IMAGE_EXTS]
+    files.sort(key=lambda f: (natural_key(str(f.parent.relative_to(folder))), natural_key(f.name)))
+
+    found, unreadable = [], 0
+    for f in files:
+        try:
+            with PILImage.open(f) as img:
+                w, h = img.size
+                # EXIF orientation 5–8 = rotated 90°: browsers (and OpenCV) show it as h × w
+                if img.getexif().get(0x0112) in (5, 6, 7, 8):
+                    w, h = h, w
+        except Exception:
+            unreadable += 1
+            continue
+        found.append((f, w, h))
+    return found, unreadable
+
+
+async def import_folder(project_id: str, folder_path: Path, db: aiosqlite.Connection,
+                        recursive: bool = False) -> ImportResult:
+    """Import every image in folder_path into the project (dedupe by resolved file path)."""
+    found, unreadable = await asyncio.to_thread(_scan_folder, folder_path, recursive)
+    if not found:
+        raise HTTPException(status_code=400, detail="No valid images (JPG/PNG/WEBP/BMP/TIFF) found in selected folder")
+
+    cur = await db.execute("SELECT filepath FROM images WHERE project_id = ?", (project_id,))
+    existing = {str(Path(r["filepath"]).resolve()) for r in await cur.fetchall()}
+    cur = await db.execute("SELECT COALESCE(MAX(seq), 0) AS s FROM images WHERE project_id = ?", (project_id,))
+    seq = (await cur.fetchone())["s"]
+
+    rows, skipped, group_cache = [], unreadable, {}
+    for fpath, w, h in found:
+        abs_path = str(fpath.resolve())
+        if abs_path in existing:
+            skipped += 1
+            continue
+        existing.add(abs_path)
+        seq += 1
+        parent = fpath.parent
+        group = group_cache.setdefault(parent, seq_group_for(parent))
+        rows.append((new_id(), project_id, fpath.name, abs_path, w, h, seq, group))
+
+    # Short transactions so annotators' saves are never blocked for long
+    for batch in chunks(rows, 500):
+        await db.executemany(
+            "INSERT OR IGNORE INTO images (id, project_id, filename, filepath, width, height, seq, seq_group) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            batch,
+        )
+        await db.commit()
+
+    await db.execute("UPDATE project SET source_folder = ? WHERE id = ?", (str(folder_path), project_id))
+    if rows:
+        await db.execute(
+            "UPDATE project SET thumbnail_image_id = ? WHERE id = ? AND thumbnail_image_id IS NULL",
+            (rows[0][0], project_id),
+        )
+    await db.commit()
+
+    await emit_stats(await project_stats(project_id, db), project_id)
+    await emit_global_projects_changed()
+    return ImportResult(imported=len(rows), skipped=skipped, folder=str(folder_path))
+
 
 @router.post("/projects/{project_id}/import", response_model=ImportResult)
 async def import_images(
     project_id: str,
     body: Optional[ImportFolderRequest] = None,
     db: aiosqlite.Connection = Depends(get_db),
-    admin: dict = Depends(get_admin_user),
+    _admin: dict = Depends(get_admin_user),
 ):
-    """Imports JPGs from a folder path into the specified project."""
-    await _get_project_or_404(project_id, db)
+    """Imports images from a folder path (or a native folder picker on the server) into the project."""
+    await get_project_or_404(project_id, db)
 
-    import asyncio
-    import sys
-
-    folder = None
-    if body and body.folder_path:
-        folder = body.folder_path.strip()
-
+    folder = (body.folder_path or "").strip().strip('"') if body else ""
     if not folder:
         script_path = Path(__file__).parent / "pick_folder.py"
         proc = await asyncio.create_subprocess_exec(
             sys.executable, str(script_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        try:
+            # The dialog opens on the server's screen; nobody there → give up instead of hanging
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise HTTPException(status_code=408, detail="No folder was picked on the server within 5 minutes")
         if proc.returncode != 0:
             raise HTTPException(status_code=400, detail="No folder selected")
-        folder = stdout.decode().strip()
+        folder = stdout.decode("utf-8", errors="replace").strip()
 
     if not folder:
         raise HTTPException(status_code=400, detail="No folder selected")
-
     folder_path = Path(folder)
-    if not folder_path.exists():
+    if not folder_path.is_dir():
         raise HTTPException(status_code=400, detail=f"Folder not found: {folder}")
 
-    VALID_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+    return await import_folder(project_id, folder_path, db, bool(body and body.include_subfolders))
 
-    raw_files = [f for f in folder_path.iterdir() if f.is_file() and f.suffix.lower() in VALID_EXTS]
-    seen_paths = set()
-    jpg_files = []
-    for f in sorted(raw_files):
-        resolved_str = str(f.resolve())
-        if resolved_str not in seen_paths:
-            seen_paths.add(resolved_str)
-            jpg_files.append(f)
 
-    if not jpg_files:
-        raise HTTPException(status_code=400, detail="No valid images (JPG/PNG/WEBP/BMP/TIFF) found in selected folder")
+# ── Missing files / relink ────────────────────────────────────────────────────
 
-    # Get already-imported filenames and filepaths for this project
-    cur = await db.execute("SELECT filename, filepath FROM images WHERE project_id = ?", (project_id,))
-    rows = await cur.fetchall()
-    existing_filenames = {r["filename"] for r in rows}
-    existing_filepaths = {str(Path(r["filepath"]).resolve()) for r in rows if r["filepath"]}
+class RelinkRequest(BaseModel):
+    folder_path: str
+    dry_run: bool = False
 
-    from PIL import Image as PILImage
-    imported = 0
-    skipped = 0
-    first_new_image_id = None
-    seen_in_batch = set()
 
-    try:
-        for fpath in jpg_files:
-            fname = fpath.name
-            abs_path = str(fpath.resolve())
+def _missing_files(rows: list[dict]) -> list[dict]:
+    return [r for r in rows if not Path(r["filepath"]).exists()]
 
-            if fname in existing_filenames or abs_path in existing_filepaths or abs_path in seen_in_batch:
-                skipped += 1
-                continue
 
-            seen_in_batch.add(abs_path)
+@router.get("/projects/{project_id}/files/check")
+async def check_files(
+    project_id: str,
+    db: aiosqlite.Connection = Depends(get_db),
+    _admin: dict = Depends(get_admin_user),
+):
+    """How many of the project's image files are missing on disk (e.g. after moving a folder)."""
+    await get_project_or_404(project_id, db)
+    cur = await db.execute("SELECT id, filename, filepath FROM images WHERE project_id = ?", (project_id,))
+    rows = [dict(r) for r in await cur.fetchall()]
+    missing = await asyncio.to_thread(_missing_files, rows)
+    folders = sorted({str(Path(r["filepath"]).parent) for r in missing})
+    return {"total": len(rows), "missing": len(missing), "missing_folders": folders[:20]}
 
-            try:
-                with PILImage.open(fpath) as img:
-                    w, h = img.size
-            except Exception:
-                skipped += 1
-                continue
 
-            iid = new_id()
-            try:
-                await db.execute(
-                    "INSERT INTO images (id, project_id, filename, filepath, width, height) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (iid, project_id, fname, str(fpath), w, h),
-                )
-                existing_filenames.add(fname)
-                existing_filepaths.add(abs_path)
-                if first_new_image_id is None:
-                    first_new_image_id = iid
-                imported += 1
-            except aiosqlite.IntegrityError:
-                skipped += 1
-                continue
+@router.post("/projects/{project_id}/files/relink")
+async def relink_files(
+    project_id: str,
+    body: RelinkRequest,
+    db: aiosqlite.Connection = Depends(get_db),
+    _admin: dict = Depends(get_admin_user),
+):
+    """
+    Point missing images at a new folder: each missing file is matched by filename
+    anywhere under folder_path. Annotations are untouched.
+    """
+    await get_project_or_404(project_id, db)
+    root = Path(body.folder_path.strip().strip('"'))
+    if not root.is_dir():
+        raise HTTPException(status_code=400, detail=f"Folder not found: {root}")
 
-        await db.execute(
-            "UPDATE project SET source_folder = ? WHERE id = ?",
-            (str(folder_path), project_id),
-        )
+    cur = await db.execute("SELECT id, filename, filepath FROM images WHERE project_id = ?", (project_id,))
+    rows = [dict(r) for r in await cur.fetchall()]
 
-        # Set thumbnail to first image if not already set
-        if first_new_image_id:
-            cur = await db.execute(
-                "SELECT thumbnail_image_id FROM project WHERE id = ?", (project_id,)
-            )
-            proj_row = await cur.fetchone()
-            if not proj_row["thumbnail_image_id"]:
-                await db.execute(
-                    "UPDATE project SET thumbnail_image_id = ? WHERE id = ?",
-                    (first_new_image_id, project_id),
-                )
+    def plan() -> tuple[list[tuple[str, str]], int]:
+        missing = _missing_files(rows)
+        if not missing:
+            return [], 0
+        by_name: dict[str, list[Path]] = {}
+        for f in root.rglob("*"):
+            if f.is_file() and f.suffix.lower() in IMAGE_EXTS:
+                by_name.setdefault(f.name, []).append(f)
+        updates, unresolved = [], 0
+        for r in missing:
+            candidates = by_name.get(r["filename"], [])
+            if len(candidates) > 1 and len({c.stat().st_size for c in candidates}) == 1:
+                # Identical copies (e.g. the same frame in several exports): any of them will do
+                candidates = [max(candidates, key=lambda c: c.stat().st_mtime)]
+            if len(candidates) == 1:
+                updates.append((str(candidates[0].resolve()), r["id"]))
+            else:
+                # prefer the candidate whose parent folder name matches the old one
+                old_parent = Path(r["filepath"]).parent.name
+                same = [c for c in candidates if c.parent.name == old_parent]
+                if len(same) == 1:
+                    updates.append((str(same[0].resolve()), r["id"]))
+                else:
+                    unresolved += 1
+        return updates, unresolved
 
+    updates, unresolved = await asyncio.to_thread(plan)
+    if not body.dry_run and updates:
+        for batch in chunks(updates):
+            await db.executemany("UPDATE OR IGNORE images SET filepath = ? WHERE id = ?", batch)
+        await db.execute("UPDATE project SET source_folder = ? WHERE id = ?", (str(root), project_id))
         await db.commit()
-    except Exception:
-        await db.rollback()
-        raise
-
-    # Broadcast updated stats
-    stats = await _project_stats(project_id, db)
-    await emit_stats(stats, project_id)
-    await emit_global_projects_changed()
-
-    return ImportResult(imported=imported, skipped=skipped, folder=str(folder_path))
+        await asyncio.to_thread(remove_thumbnails, [iid for _, iid in updates])
+    return {"relinked": len(updates), "unresolved": unresolved, "dry_run": body.dry_run}
 
 
 # ── Per-project stats ─────────────────────────────────────────────────────────
 
 @router.get("/projects/{project_id}/stats")
-async def project_stats(
+async def get_project_stats(
     project_id: str,
     db: aiosqlite.Connection = Depends(get_db),
-    _user: dict = Depends(get_current_user),
+    user: dict = Depends(get_current_user),
 ):
-    await _get_project_or_404(project_id, db)
-    return await _project_stats(project_id, db)
-
-
-# ── Deprecated global /project endpoints (backward compat) ───────────────────
-
-@router.get("/project")
-async def _deprecated_get_project():
-    raise HTTPException(
-        status_code=410,
-        detail="Deprecated. Use GET /api/projects or GET /api/projects/{project_id}",
-    )
-
-@router.post("/project")
-async def _deprecated_create_project():
-    raise HTTPException(
-        status_code=410,
-        detail="Deprecated. Use POST /api/projects",
-    )
+    await get_accessible_project(project_id, user, db)
+    return await project_stats(project_id, db)
 
 
 # ── User management (admin only) ──────────────────────────────────────────────
@@ -447,9 +457,8 @@ async def list_users(
     db: aiosqlite.Connection = Depends(get_db),
     _admin: dict = Depends(get_admin_user),
 ):
-    cur = await db.execute("SELECT * FROM users ORDER BY created_at")
-    rows = await cur.fetchall()
-    return [UserOut(**dict(r)) for r in rows]
+    cur = await db.execute("SELECT * FROM users WHERE is_active = 1 ORDER BY created_at")
+    return [UserOut(**dict(r)) for r in await cur.fetchall()]
 
 
 @router.post("/users", response_model=UserOut, status_code=201)
@@ -468,7 +477,6 @@ async def create_user(
         (uid, body.username, hash_password(body.password), int(body.is_admin), now_iso()),
     )
     await db.commit()
-
     cur = await db.execute("SELECT * FROM users WHERE id = ?", (uid,))
     return UserOut(**dict(await cur.fetchone()))
 
@@ -479,34 +487,56 @@ async def delete_user(
     db: aiosqlite.Connection = Depends(get_db),
     admin: dict = Depends(get_admin_user),
 ):
+    """
+    Deactivates the user (their annotations keep their author) and returns their
+    not-yet-annotated images to the unassigned pool. Annotated work keeps its state.
+    """
     if user_id == admin["id"]:
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
+    cur = await db.execute("SELECT username FROM users WHERE id = ? AND is_active = 1", (user_id,))
+    row = await cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
 
-    # Unassign their images across all projects
-    await db.execute(
+    cur = await db.execute(
         "UPDATE images SET state='unassigned', assigned_to=NULL, assigned_at=NULL "
-        "WHERE assigned_to = ?",
+        "WHERE assigned_to = ? AND state IN ('assigned', 'unannotated') RETURNING project_id",
         (user_id,),
     )
-    await db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    touched = {r["project_id"] for r in await cur.fetchall()}
+    cur = await db.execute(
+        "UPDATE images SET assigned_to=NULL, assigned_at=NULL WHERE assigned_to = ? RETURNING project_id",
+        (user_id,),
+    )
+    touched |= {r["project_id"] for r in await cur.fetchall()}
+    # Free the username for re-use while keeping the row for annotation history
+    await db.execute(
+        "UPDATE users SET is_active = 0, username = ? WHERE id = ?",
+        (f"{row['username']}~deleted~{user_id[:8]}", user_id),
+    )
+    await bump_token_version(db, user_id)
     await db.commit()
 
-    return {"detail": "User deleted and images unassigned"}
+    for pid in touched:
+        await emit_stats(await project_stats(pid, db), pid)
+    return {"detail": "User deleted and their pending images unassigned"}
 
 
 @router.patch("/users/{user_id}/password")
 async def change_password(
     user_id: str,
-    body: dict,
+    body: SetPasswordRequest,
     db: aiosqlite.Connection = Depends(get_db),
     admin: dict = Depends(get_admin_user),
 ):
-    new_pw = body.get("password", "")
-    if len(new_pw) < 4:
-        raise HTTPException(status_code=400, detail="Password too short")
-    await db.execute(
-        "UPDATE users SET password_hash = ? WHERE id = ?",
-        (hash_password(new_pw), user_id),
+    """Admin sets a temporary password: the user is signed out and must pick their own next time."""
+    other = user_id != admin["id"]
+    res = await db.execute(
+        "UPDATE users SET password_hash = ?, must_change_password = ?, "
+        "token_version = token_version + ? WHERE id = ? AND is_active = 1",
+        (hash_password(body.password), int(other), int(other), user_id),
     )
+    if res.rowcount == 0:
+        raise HTTPException(status_code=404, detail="User not found")
     await db.commit()
     return {"detail": "Password updated"}

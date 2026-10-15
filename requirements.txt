@@ -2,18 +2,18 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 python-socketio>=5.11.0
 python-multipart>=0.0.9
-python-jose[cryptography]>=3.3.0
-passlib[bcrypt]>=1.7.4
+python-jose[cryptography]>=3.4.0
+bcrypt>=4.1
 aiosqlite>=0.20.0
 aiofiles>=23.2.1
 pillow>=10.4.0
 python-dotenv>=1.0.1
 jinja2>=3.1.4
 static-ffmpeg>=2.5.0
-# ── Training ──────────────────────────────────────────────────────────────────
-# torch + torchvision installed separately:
-#   pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
+# ── Training / model assist ───────────────────────────────────────────────────
+# torch + torchvision come from requirements-cpu.txt (this kind of laptop) or
+# requirements-gpu.txt (NVIDIA GPU). See INSTALL.md.
 ultralytics==8.4.30
 psutil>=5.9.0
-pynvml>=11.5.0
+nvidia-ml-py>=12.0
 pyyaml>=6.0

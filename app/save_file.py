@@ -4,6 +4,8 @@ import sys
 import os
 
 def main():
+    # Parent process decodes UTF-8 (paths may contain non-ASCII characters)
+    sys.stdout.reconfigure(encoding="utf-8")
     default_path = sys.argv[1] if len(sys.argv) > 1 else ""
     initial_dir = ""
     initial_file = ""

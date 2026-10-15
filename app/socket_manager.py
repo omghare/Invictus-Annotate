@@ -4,19 +4,41 @@ Now supports per-project rooms so events from one project don't
 bleed into other projects' clients.
 """
 import asyncio
+from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import parse_qs
 
+import aiosqlite
 import socketio
 
-from app.auth import decode_token
+from app.config import DB_PATH
 
 # ── Server instance (shared across the whole app) ────────────────────────────
 sio = socketio.AsyncServer(
     async_mode="asgi",
-    cors_allowed_origins="*",        # LAN tool — all origins OK
+    cors_allowed_origins=None,       # same origin only (whatever host/IP the page was opened on)
     ping_timeout=60,
     ping_interval=25,
 )
+
+
+async def _db_user(token: Optional[str]) -> Optional[dict]:
+    """Same checks as HTTP auth: valid signature, not revoked, account active."""
+    from app.auth import user_for_token
+    if not token:
+        return None
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        return await user_for_token(token, db)
+
+
+async def _may_join(user_info: dict, project_id: str) -> bool:
+    if user_info["is_admin"]:
+        return True
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT 1 FROM images WHERE project_id = ? AND assigned_to = ? LIMIT 1",
+                               (project_id, user_info["user_id"]))
+        return await cur.fetchone() is not None
 
 # ── Room names ────────────────────────────────────────────────────────────────
 ADMIN_ROOM    = "admin_room"
@@ -43,35 +65,29 @@ async def connect(sid: str, environ: dict, auth: Optional[dict] = None):
 
     if not token:
         # Also try query string (for clients that can't set auth)
-        qs = environ.get("QUERY_STRING", "")
-        for part in qs.split("&"):
-            if part.startswith("token="):
-                token = part[6:]
-            elif part.startswith("project_id="):
-                project_id = part[11:]
+        qs = parse_qs(environ.get("QUERY_STRING", ""))
+        token = (qs.get("token") or [None])[0]
+        project_id = project_id or (qs.get("project_id") or [None])[0]
 
-    if not token:
-        await sio.disconnect(sid)
-        return
-
-    payload = decode_token(token)
-    if payload is None:
-        await sio.disconnect(sid)
-        return
+    user = await _db_user(token)
+    if user is None:
+        # Client receives connect_error with this message and can redirect to login
+        raise ConnectionRefusedError("unauthorized")
 
     user_info = {
-        "user_id":    payload["sub"],
-        "username":   payload["username"],
-        "is_admin":   payload.get("is_admin", False),
-        "project_id": project_id,
+        "user_id":    user["id"],
+        "username":   user["username"],
+        "is_admin":   bool(user["is_admin"]),
+        "project_id": None,
     }
     _connected[sid] = user_info
 
     # Everyone joins the global room (home-page project list updates)
     await sio.enter_room(sid, global_room())
 
-    # Join project-specific room if a project_id was provided
-    if project_id:
+    # Join project-specific room if a project_id was provided (and the user may see it)
+    if project_id and await _may_join(user_info, project_id):
+        user_info["project_id"] = project_id
         await sio.enter_room(sid, project_room(project_id))
 
     # Admins also join the admin room for the detailed activity feed
@@ -96,7 +112,7 @@ async def join_project(sid: str, data: dict):
     if sid not in _connected:
         return
     new_pid = (data or {}).get("project_id")
-    if not new_pid:
+    if not new_pid or not await _may_join(_connected[sid], new_pid):
         return
 
     old_pid = _connected[sid].get("project_id")
@@ -112,17 +128,35 @@ async def join_project(sid: str, data: dict):
 
 @sio.event
 async def join_training_room(sid: str):
-    """Client on /train page calls this to receive training events."""
-    if sid not in _connected:
+    """Client on /train page calls this to receive training events (admins only)."""
+    info = _connected.get(sid)
+    if not info or not info["is_admin"]:
         return
     await sio.enter_room(sid, TRAINING_ROOM)
 
 
 # ── Emit helpers (called by route handlers) ───────────────────────────────────
 
+# Home-page cards get a throttled copy of each project's stats (trailing edge, 1/s max)
+_pending_global_stats: dict[str, dict] = {}
+_global_stats_tasks: dict[str, asyncio.Task] = {}
+
+
+async def _flush_global_stats(project_id: str):
+    await asyncio.sleep(1.0)
+    stats = _pending_global_stats.pop(project_id, None)
+    if stats is not None:
+        await sio.emit("project_stats_changed", {"project_id": project_id, "stats": stats},
+                       room=global_room())
+
+
 async def emit_stats(stats: dict, project_id: str):
-    """Broadcast image state counts to everyone in the project room."""
-    await sio.emit("stats_update", stats, room=project_room(project_id))
+    """Broadcast image state counts to the project room (and, throttled, to Home pages)."""
+    await sio.emit("stats_update", {**stats, "project_id": project_id}, room=project_room(project_id))
+    _pending_global_stats[project_id] = stats
+    task = _global_stats_tasks.get(project_id)
+    if task is None or task.done():
+        _global_stats_tasks[project_id] = asyncio.create_task(_flush_global_stats(project_id))
 
 async def emit_global_projects_changed():
     """Notify home page clients that the project list changed (create/delete)."""
@@ -136,31 +170,73 @@ async def emit_state_change(image_id: str, new_state: str, assigned_to: Optional
         "assigned_to": assigned_to,
     }, room=project_room(project_id))
 
-async def emit_annotation_saved(image_id: str, box_count: int, saved_by: str):
-    """Notify admin feed about a save event."""
-    from datetime import datetime, timezone
-    await sio.emit("annotation_saved", {
-        "image_id":  image_id,
-        "box_count": box_count,
-        "saved_by":  saved_by,
+async def emit_state_change_bulk(changes: list[dict], project_id: str, summary: Optional[str] = None):
+    """
+    One event for many state changes (assign / propagate / submit-all).
+    changes: [{image_id, new_state, assigned_to}]
+    """
+    if not changes:
+        return
+    await sio.emit("image_state_change_bulk", {
+        "changes": changes,
+        "summary": summary,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-    }, room=ADMIN_ROOM)
+    }, room=project_room(project_id))
+
+async def emit_annotation_saved(image_id: str, box_count: int, saved_by: str, project_id: str):
+    """Activity-feed event for a single save."""
+    await sio.emit("annotation_saved", {
+        "image_id":   image_id,
+        "box_count":  box_count,
+        "saved_by":   saved_by,
+        "project_id": project_id,
+        "timestamp":  datetime.now(timezone.utc).isoformat(),
+    }, room=project_room(project_id))
+
+async def emit_annotations_bulk_saved(project_id: str, image_ids: list[str], saved_by: str,
+                                      kind: str, batch_id: Optional[str]):
+    """Activity-feed + reload hint for propagate / interpolate / undo."""
+    await sio.emit("annotations_bulk_saved", {
+        "image_ids":  image_ids,
+        "saved_by":   saved_by,
+        "kind":       kind,
+        "batch_id":   batch_id,
+        "project_id": project_id,
+        "timestamp":  datetime.now(timezone.utc).isoformat(),
+    }, room=project_room(project_id))
 
 async def emit_image_deleted(image_id: str, project_id: str):
     """Notify all clients in the project room that an image was deleted."""
     await sio.emit("image_deleted", {"image_id": image_id}, room=project_room(project_id))
 
-async def emit_export_progress(done: int, total: int, project_id: str):
-    """Stream export progress to admin."""
-    await sio.emit("export_progress", {
-        "done":    done,
-        "total":   total,
-        "percent": round(done / total * 100) if total else 100,
-    }, room=ADMIN_ROOM)
+async def emit_images_deleted(image_ids: list[str], project_id: str):
+    """One event for a bulk delete (clients drop all ids at once)."""
+    if image_ids:
+        await sio.emit("images_deleted", {"image_ids": image_ids}, room=project_room(project_id))
 
-async def emit_project_updated(classes: list, project_id: str):
-    """Notify all annotators in the project that the class list changed."""
-    await sio.emit("project_updated", {"classes": classes}, room=project_room(project_id))
+async def emit_export_progress(done: int, total: int, project_id: str):
+    """Stream export progress to the project's room."""
+    await sio.emit("export_progress", {
+        "done":       done,
+        "total":      total,
+        "percent":    round(done / total * 100) if total else 100,
+        "project_id": project_id,
+    }, room=project_room(project_id))
+
+async def emit_video_progress(project_id: str, percent: float, stage: str):
+    """Frame-extraction progress for the Video → Frames page."""
+    await sio.emit("video_progress", {
+        "percent": round(percent, 1), "stage": stage, "project_id": project_id,
+    }, room=project_room(project_id))
+
+async def emit_project_updated(classes: list, project_id: str, renames: Optional[dict] = None):
+    """Notify all annotators in the project that the class list changed (renames: {old: new})."""
+    await sio.emit("project_updated", {"classes": classes, "renames": renames or {}}, room=project_room(project_id))
+
+async def emit_job_update(job: dict):
+    """Progress / completion of a background job (to its project room, or admins for global jobs)."""
+    room = project_room(job["project_id"]) if job.get("project_id") else ADMIN_ROOM
+    await sio.emit("job_update", job, room=room)
 
 
 # ── Training emit helpers ─────────────────────────────────────────────────────────────────

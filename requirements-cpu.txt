@@ -1,0 +1,7 @@
+# Machines without an NVIDIA GPU (laptops with Intel / AMD graphics).
+# The CPU build of PyTorch is ~0.5 GB instead of ~4.5 GB for the CUDA build.
+#   pip install -r requirements-cpu.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
+-r requirements.txt

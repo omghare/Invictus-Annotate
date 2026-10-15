@@ -29,10 +29,13 @@ const YOLO_MODELS = {
 };
 
 const PRESETS = {
-  fast:    { epochs: 10,  batch: 8,  imgsz: 320, patience: 10, lr0: 0.01,  optimizer: 'SGD',   workers: 2, device: 'cpu' },
-  optimal: { epochs: 100, batch: 16, imgsz: 416, patience: 30, lr0: 0.01,  optimizer: 'SGD',   workers: 2, device: 'cpu' },
-  highres: { epochs: 100, batch: 8,  imgsz: 640, patience: 50, lr0: 0.005, optimizer: 'AdamW', workers: 2, device: 'cpu' },
+  fast:    { epochs: 10,  batch: 8,  imgsz: 320, patience: 10, lr0: 0.01,  optimizer: 'SGD',   workers: 2 },
+  optimal: { epochs: 100, batch: 16, imgsz: 416, patience: 30, lr0: 0.01,  optimizer: 'SGD',   workers: 2 },
+  highres: { epochs: 100, batch: 8,  imgsz: 640, patience: 50, lr0: 0.005, optimizer: 'AdamW', workers: 2 },
 };
+
+/** Finite number or null — NaN / Infinity from a diverging run arrive as null. */
+const fin = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
 
 // ── State ──────────────────────────────────────────────────────────────────────
 
@@ -58,38 +61,46 @@ const State = {
   availMemoryGb:    0,            // available for slider context
   hasCuda:          false,
   avgEpochMs:       0,            // rolling average epoch duration from worker
+  sysReady:         null,         // promise: system info loaded
+  memoryTouched:    false,        // the user moved the memory slider (otherwise no cap is sent)
+  lastEpoch:        0,            // last epoch drawn for the current session (reconnect catch-up)
+  best:             { map50: null, box: null },
+  shownComplete:    null,         // session id whose completion was already announced
+  dismissed:        IA.store.get('ia_train_dismissed', null),
 };
 
 // ── Init ───────────────────────────────────────────────────────────────────────
 
-window.addEventListener('DOMContentLoaded', () => {
+window.addEventListener('DOMContentLoaded', async () => {
+  if (!IA.requireAuth(true)) return;
   checkAuth();
+  await IA.ensureSession();
   renderModelCards();
   initSocket();
-  loadSystemInfo();
+  State.sysReady = loadSystemInfo();
   startHardwarePolling();
-  checkExistingSession();
-  loadModelsLibrary();
+  loadRuns();
   initCharts();
+  document.getElementById('import-result-input').addEventListener('change', importCloudResult);
 });
 
 function checkAuth() {
-  const token = localStorage.getItem('ia_token');
-  if (!token) { window.location.href = '/login'; return; }
+  // core.js: redirects to login (or home for annotators) and renders the app shell
+  IA.shell({ adminOnly: true, section: 'train' });
+  IA.setCrumbs([{ label: 'Train model' }]);
 }
 
 // ── Socket.IO ──────────────────────────────────────────────────────────────────
 
 function initSocket() {
-  const token = localStorage.getItem('ia_token');
-  State.socket = io({ auth: { token } });
+  State.socket = IA.connectSocket();
+  if (!State.socket) return;
 
+  // Re-join and re-sync on every (re)connect so events missed while offline are recovered
   State.socket.on('connect', () => {
     State.socket.emit('join_training_room');
-    setConnected(true);
+    checkExistingSession();
   });
-  State.socket.on('disconnect', () => setConnected(false));
-  State.socket.on('connect_error', () => setConnected(false));
 
   State.socket.on('train_log',      (d) => appendLog(d.line));
   State.socket.on('train_epoch',    (d) => onEpoch(d));
@@ -100,10 +111,6 @@ function initSocket() {
   State.socket.on('train_status',   (d) => syncStatus(d));
 }
 
-function setConnected(ok) {
-  document.getElementById('conn-dot').classList.toggle('connected', ok);
-  document.getElementById('conn-label').textContent = ok ? 'Connected' : 'Disconnected';
-}
 
 // ── System Info ────────────────────────────────────────────────────────────────
 
@@ -136,9 +143,10 @@ function renderSystemInfo(info) {
     setText('model-vram-hint', info.vram_total_mb ? `${Math.round(info.vram_total_mb / 1024 * 10) / 10} GB VRAM` : '—');
   } else {
     setText('model-vram-hint', `${info.ram_total_gb || 14} GB RAM (CPU Execution Mode)`);
-    const devInput = document.getElementById('p-device');
-    if (devInput) devInput.value = 'cpu';
   }
+  // "auto" trains on the GPU when one works, else on the CPU — right on both machines
+  const devInput = document.getElementById('p-device');
+  if (devInput && !devInput.value.trim()) devInput.value = 'auto';
 
   const torch_ok = info.torch_version && !info.torch_version.includes('Not');
   document.getElementById('si-torch').closest('.sys-card').classList.toggle('ok', torch_ok);
@@ -177,9 +185,9 @@ function renderSystemDetailPanel(info) {
 
   grid.innerHTML = cells.map(c => `
     <div class="sys-detail-cell">
-      <div class="sdc-label">${c.label}</div>
-      <div class="sdc-value">${c.value}</div>
-      ${c.sub ? `<div class="sdc-sub">${c.sub}</div>` : ''}
+      <div class="sdc-label">${IA.esc(c.label)}</div>
+      <div class="sdc-value">${IA.esc(c.value)}</div>
+      ${c.sub ? `<div class="sdc-sub">${IA.esc(c.sub)}</div>` : ''}
     </div>
   `).join('');
 
@@ -209,9 +217,10 @@ function buildMemorySlider(info) {
   slider.max   = totalGb;
   slider.step  = 0.5;
 
-  // Default: 75% of available, rounded to nearest 0.5
-  const defaultVal = Math.max(0.5, Math.round(availGb * 0.75 * 2) / 2);
+  // Default: GPU → all of it (no cap unless the user asks for one); CPU → 75 % of free RAM (advisory)
+  const defaultVal = hasCuda ? totalGb : Math.max(0.5, Math.round(availGb * 0.75 * 2) / 2);
   slider.value = Math.min(defaultVal, totalGb);
+  slider.oninput = (e) => { State.memoryTouched = true; onMemorySliderChange(e.target.value); };
 
   onMemorySliderChange(slider.value);
 }
@@ -241,7 +250,7 @@ function onMemorySliderChange(valStr) {
   const typeStr = State.hasCuda ? 'VRAM' : 'RAM';
   if (hint) {
     if (pct >= 90) {
-      hint.textContent = `⚠ Allocating almost all ${typeStr} — leave headroom for the OS.`;
+      hint.textContent = `Allocating almost all ${typeStr} — leave headroom for the OS.`;
       hint.style.color = 'var(--orange)';
     } else if (pct >= 75) {
       hint.textContent = `This is a comfortable allocation. Batch size will be tuned accordingly.`;
@@ -255,7 +264,7 @@ function onMemorySliderChange(valStr) {
   // Update slider track fill colour via CSS gradient on background
   const slider = document.getElementById('mem-slider');
   if (slider) {
-    const fillColor = pct >= 90 ? '#ff5f7e' : pct >= 75 ? '#ff9940' : '#7c6dff';
+    const fillColor = pct >= 90 ? '#f2555a' : pct >= 75 ? '#ec8b43' : '#3d8bfd';
     slider.style.background = `linear-gradient(90deg, ${fillColor} 0%, ${fillColor} ${pct}%, var(--bg-elevated) ${pct}%, var(--bg-elevated) 100%)`;
   }
 
@@ -267,12 +276,14 @@ function onMemorySliderChange(valStr) {
 // ── Hardware Gauges ────────────────────────────────────────────────────────────
 
 function startHardwarePolling() {
+  // While training, the server pushes hardware stats over the socket
   setInterval(async () => {
+    if (State.isTraining || document.visibilityState !== 'visible') return;
     try {
       const stats = await apiFetch('/api/train/system-stats');
       updateHardwareAll(stats);
     } catch (_) {}
-  }, 2000);
+  }, 3000);
 }
 
 function updateHardwareAll(stats) {
@@ -364,7 +375,8 @@ function onCustomModelInput() {
     updateStepNum(2, 'active');
     const btnParams = document.getElementById('btn-apply-params');
     if (btnParams) btnParams.disabled = false;
-  } else if (!State.selectedModel) {
+  } else if (!document.querySelector('.model-card.selected')) {
+    State.selectedModel = null;                       // cleared the box and no card picked
     updateStepTag('model', '', 'pending');
   }
   checkLaunchReady();
@@ -387,7 +399,7 @@ function updateModelCardMemStates() {
 
     if (m.key === recKey) {
       card.classList.add('recommended');
-      card.insertAdjacentHTML('beforeend', `<div class="mc-rec-badge">AI Pick</div>`);
+      card.insertAdjacentHTML('beforeend', `<div class="mc-rec-badge">Suggested</div>`);
     }
 
     if (budget !== null && budget < m.memGb) {
@@ -412,6 +424,11 @@ async function pickDatasetFolder() {
   }
 }
 
+function resetDatasetPanels() {
+  ['dataset-intel', 'intel-split-bar-wrap', 'intel-classes-row', 'rec-card'].forEach((id) => show(id, false));
+  State.recommendation = null;
+}
+
 function onDatasetPathInput() {
   document.getElementById('dataset-info').classList.add('hidden');
   State.datasetInfo = null;
@@ -427,6 +444,7 @@ async function validateCurrentPath() {
 }
 
 async function validateDatasetPath(folderPath) {
+  resetDatasetPanels();
   try {
     const r = await apiFetch('/api/train/validate-dataset', {
       method: 'POST',
@@ -449,7 +467,7 @@ function renderDatasetInfo(info) {
     const split = splits[s] || {};
     const isRequired = s === 'train';
     const cls   = split.exists ? 'ok' : (isRequired ? 'miss' : 'warn');
-    const icon  = split.exists ? '✅' : (isRequired ? '❌' : '⚠️');
+    const icon  = split.exists ? IA.icon('circle-check') : (isRequired ? IA.icon('octagon-x') : IA.icon('circle-alert'));
     const count = split.exists ? `${split.count} imgs` : (isRequired ? 'Missing!' : 'Optional');
     return `
       <div class="split-info-card ${cls}">
@@ -469,14 +487,14 @@ function renderDatasetInfo(info) {
   const yamlInput = document.getElementById('yaml-path-input');
 
   if (yaml.exists && yaml.path) {
-    yamlIcon.textContent = '📄';
+    yamlIcon.innerHTML = IA.icon('circle-check');
     yamlText.textContent = 'data.yaml found';
     yamlText.style.color = 'var(--green)';
     yamlInput.value = yaml.path;
     document.getElementById('btn-pick-yaml').style.display = 'none';
     State.yamlPath = yaml.path;
   } else {
-    yamlIcon.textContent = '⚠️';
+    yamlIcon.innerHTML = IA.icon('circle-alert');
     yamlText.textContent = 'No yaml found — select manually:';
     yamlText.style.color = 'var(--yellow)';
     yamlInput.value = '';
@@ -487,11 +505,11 @@ function renderDatasetInfo(info) {
   // Errors / warnings
   const errDiv = document.getElementById('validation-errors');
   const msgs = [
-    ...(info.errors   || []).map(e => ({ cls: 'err',  icon: '❌', text: e })),
-    ...(info.warnings || []).map(w => ({ cls: 'warn', icon: '⚠️', text: w })),
+    ...(info.errors   || []).map(e => ({ cls: 'err',  icon: IA.icon('octagon-x'), text: e })),
+    ...(info.warnings || []).map(w => ({ cls: 'warn', icon: IA.icon('circle-alert'), text: w })),
   ];
   errDiv.innerHTML = msgs.map(m =>
-    `<div class="validation-msg ${m.cls}">${m.icon} ${m.text}</div>`
+    `<div class="validation-msg ${m.cls}">${m.icon} ${IA.esc(m.text)}</div>`
   ).join('');
 
   document.getElementById('dataset-info').classList.remove('hidden');
@@ -509,16 +527,13 @@ function renderDatasetInfo(info) {
 
   // Render extended dataset intelligence
   renderDatasetIntelligence(info);
-
-  // Show system detail panel now that we have context
-  renderSystemDetailPanel(State.systemInfo);
-
   checkLaunchReady();
 
-  // Load AI recommendations
-  if (info.is_valid) {
-    loadRecommendations();
-  }
+  // System info may still be loading (the first probe imports torch): wait for it
+  Promise.resolve(State.sysReady).then(() => {
+    renderSystemDetailPanel(State.systemInfo);
+    if (info.is_valid) loadRecommendations();
+  });
 }
 
 function renderDatasetIntelligence(info) {
@@ -583,7 +598,7 @@ function renderDatasetIntelligence(info) {
     classesRow.innerHTML = `
       <div class="intel-classes-label">Class Names</div>
       <div class="class-chips">
-        ${shown.map(n => `<span class="class-chip">${n}</span>`).join('')}
+        ${shown.map(n => `<span class="class-chip">${IA.esc(n)}</span>`).join('')}
         ${extra > 0 ? `<span class="class-chip-more">+${extra} more</span>` : ''}
       </div>
     `;
@@ -600,7 +615,7 @@ async function pickYamlFile() {
     State.yamlPath = r.path;
     checkLaunchReady();
   } catch (e) {
-    showToast('No file selected', 'error');
+    showToast(e.message || 'No file selected', e.message?.includes('No file') ? 'info' : 'error');
   }
 }
 
@@ -619,7 +634,8 @@ async function loadRecommendations(overrideModel) {
       vram_total_gb:      sys.vram_total_gb      || 0,
       ram_available_gb:   sys.ram_available_gb   || 8,
       cpu_count_physical: sys.cpu_count_physical || 2,
-      memory_budget_gb:   State.memoryBudgetGb   || null,
+      memory_budget_gb:   State.memoryTouched ? State.memoryBudgetGb : null,
+      model:              overrideModel || State.selectedModel || null,
     };
 
     const rec = await apiFetch('/api/train/recommend', {
@@ -690,10 +706,10 @@ function renderRecommendations(rec) {
 
   if (fields) {
     fields.innerHTML = fieldDefs.map(f => `
-      <div class="rec-field-row" title="${rec.rationale?.[f.key] || ''}">
-        <div class="rec-field-name">${f.label}</div>
-        <div class="rec-field-value">${f.val}</div>
-        <div class="rec-field-why">${rec.rationale?.[f.key] || ''}</div>
+      <div class="rec-field-row" title="${IA.esc(rec.rationale?.[f.key] || '')}">
+        <div class="rec-field-name">${IA.esc(f.label)}</div>
+        <div class="rec-field-value">${IA.esc(f.val)}</div>
+        <div class="rec-field-why">${IA.esc(rec.rationale?.[f.key] || '')}</div>
       </div>
     `).join('');
   }
@@ -721,7 +737,7 @@ function applyParamRecommendations() {
     'p-lr0':       rec.lr0,
     'p-optimizer': rec.optimizer,
     'p-workers':   rec.workers,
-    'p-device':    rec.device,
+    'p-device':    'auto',
   };
 
   Object.entries(paramMap).forEach(([id, val]) => {
@@ -844,19 +860,19 @@ function getTrainingConfig() {
     model:             State.selectedModel,
     dataset_name:      State.datasetName || 'dataset',
     run_name_override: document.getElementById('run-name-input').value.trim() || null,
-    epochs:            parseInt(document.getElementById('p-epochs').value)    || 100,
-    batch:             parseInt(document.getElementById('p-batch').value)     || 16,
-    imgsz:             parseInt(document.getElementById('p-imgsz').value)     || 640,
-    patience:          parseInt(document.getElementById('p-patience').value)  || 50,
-    lr0:               parseFloat(document.getElementById('p-lr0').value)     || 0.01,
+    epochs:            num(document.getElementById('p-epochs').value, 100),
+    batch:             num(document.getElementById('p-batch').value, 16),
+    imgsz:             num(document.getElementById('p-imgsz').value, 640),
+    patience:          num(document.getElementById('p-patience').value, 50),
+    lr0:               num(document.getElementById('p-lr0').value, 0.01),
     optimizer:         document.getElementById('p-optimizer').value,
-    workers:           parseInt(document.getElementById('p-workers').value)   || 4,
-    device:            document.getElementById('p-device').value.trim()       || '0',
+    workers:           num(document.getElementById('p-workers').value, 4),
+    device:            document.getElementById('p-device').value.trim()       || 'auto',
     cos_lr:            document.getElementById('p-cos-lr').value === 'true',
-    warmup_epochs:     parseFloat(document.getElementById('p-warmup').value)  || 3.0,
-    weight_decay:      parseFloat(document.getElementById('p-wd').value)      || 0.0005,
-    mosaic:            parseFloat(document.getElementById('p-mosaic').value)  || 1.0,
-    memory_budget_gb:  State.memoryBudgetGb || null,
+    warmup_epochs:     num(document.getElementById('p-warmup').value, 3.0),
+    weight_decay:      num(document.getElementById('p-wd').value, 0.0005),
+    mosaic:            num(document.getElementById('p-mosaic').value, 1.0),
+    memory_budget_gb:  State.hasCuda && State.memoryTouched && State.memoryBudgetGb < State.totalMemoryGb ? State.memoryBudgetGb : null,
   };
 }
 
@@ -868,12 +884,12 @@ function evaluateWarnings() {
   const model = State.selectedModel;
   const budget = State.memoryBudgetGb;
 
-  const epochs    = parseInt(document.getElementById('p-epochs')?.value) || 100;
-  const batch     = parseInt(document.getElementById('p-batch')?.value)  || 16;
-  const imgsz     = parseInt(document.getElementById('p-imgsz')?.value)  || 416;
-  const lr0       = parseFloat(document.getElementById('p-lr0')?.value)  || 0.01;
-  const workers   = parseInt(document.getElementById('p-workers')?.value) || 2;
-  const device    = document.getElementById('p-device')?.value?.trim()   || 'cpu';
+  const epochs    = num(document.getElementById('p-epochs')?.value, 100);
+  const batch     = num(document.getElementById('p-batch')?.value, 16);
+  const imgsz     = num(document.getElementById('p-imgsz')?.value, 416);
+  const lr0       = num(document.getElementById('p-lr0')?.value, 0.01);
+  const workers   = num(document.getElementById('p-workers')?.value, 2);
+  const device    = (document.getElementById('p-device')?.value?.trim() || 'auto').toLowerCase();
 
   const hasCuda   = sys.cuda_available || false;
   const vram      = sys.vram_total_gb  || 0;
@@ -891,7 +907,7 @@ function evaluateWarnings() {
     const modelMem = getAllModelMem(model);
     const estimatedVramGb = modelMem + batch * (imgsz / 640) * 0.2;
     if (estimatedVramGb > budget) {
-      warnings.push(W('❌',
+      warnings.push(W(IA.icon('octagon-x'),
         `Batch ${batch} at ${imgsz}px may exceed your ${budget.toFixed(1)} GB VRAM budget (est. ${estimatedVramGb.toFixed(1)} GB needed). Reduce batch or image size.`,
         'danger',
         () => { setVal('p-batch', Math.max(1, Math.floor(batch / 2))); onParamChange('batch'); }
@@ -900,7 +916,7 @@ function evaluateWarnings() {
   }
 
   if (!hasCuda && batch > 16 && ramAvail < 16) {
-    warnings.push(W('⚠️',
+    warnings.push(W(IA.icon('circle-alert'),
       `Batch size ${batch} on CPU with ${ramAvail.toFixed(1)} GB available RAM may cause slowdowns or OOM. Recommended ≤ 16.`,
       'warning',
       () => { setVal('p-batch', 16); onParamChange('batch'); }
@@ -909,14 +925,14 @@ function evaluateWarnings() {
 
   // ── Epoch checks ──────────────────────────────────────────────────────────
   if (epochs > 300 && imgs < 500) {
-    warnings.push(W('⚠️',
+    warnings.push(W(IA.icon('circle-alert'),
       `${epochs} epochs with only ${imgs} images is likely to cause heavy overfitting. Consider ≤ 150 epochs with early stopping.`,
       'warning',
       () => { setVal('p-epochs', 100); onParamChange('epochs'); }
     ));
   }
   if (epochs < 10) {
-    warnings.push(W('ℹ️',
+    warnings.push(W(IA.icon('info'),
       `Only ${epochs} epochs — the model may not converge. Minimum 30–50 epochs is usually needed.`,
       'info',
       null
@@ -925,14 +941,14 @@ function evaluateWarnings() {
 
   // ── Image size on CPU ─────────────────────────────────────────────────────
   if (!hasCuda && imgsz >= 1280) {
-    warnings.push(W('❌',
+    warnings.push(W(IA.icon('octagon-x'),
       `1280 px on CPU will be extremely slow — expect hours per epoch. Use ≤ 640 px for practical CPU training.`,
       'danger',
       () => { setVal('p-imgsz', 416, true); onParamChange('imgsz'); }
     ));
   }
   if (!hasCuda && imgsz > 640) {
-    warnings.push(W('⚠️',
+    warnings.push(W(IA.icon('circle-alert'),
       `${imgsz} px on CPU may be very slow. 416 px is the recommended balance for CPU training.`,
       'warning',
       () => { setVal('p-imgsz', 416, true); onParamChange('imgsz'); }
@@ -941,7 +957,7 @@ function evaluateWarnings() {
 
   // ── Learning rate ─────────────────────────────────────────────────────────
   if (lr0 > 0.05) {
-    warnings.push(W('⚠️',
+    warnings.push(W(IA.icon('circle-alert'),
       `Learning rate ${lr0} is very high and may cause unstable training. Typical range is 0.001–0.01.`,
       'warning',
       () => { setVal('p-lr0', 0.01); onParamChange('lr0'); }
@@ -950,7 +966,7 @@ function evaluateWarnings() {
 
   // ── Workers ───────────────────────────────────────────────────────────────
   if (workers > cpuPhy && !hasCuda) {
-    warnings.push(W('ℹ️',
+    warnings.push(W(IA.icon('info'),
       `Workers (${workers}) exceeds physical CPU cores (${cpuPhy}). This may slow data loading due to context switching.`,
       'info',
       () => { setVal('p-workers', cpuPhy); onParamChange('workers'); }
@@ -960,7 +976,7 @@ function evaluateWarnings() {
   // ── Large model on CPU ────────────────────────────────────────────────────
   if (!hasCuda && model && (model.includes('yolov8l') || model.includes('yolov8x') ||
                              model.includes('yolo11l') || model.includes('yolo11x'))) {
-    warnings.push(W('❌',
+    warnings.push(W(IA.icon('octagon-x'),
       `Large/XL models on CPU are prohibitively slow. Use nano or small models for CPU training.`,
       'danger',
       () => {
@@ -971,11 +987,18 @@ function evaluateWarnings() {
   }
 
   // ── Device mismatch ───────────────────────────────────────────────────────
-  if (device !== 'cpu' && device !== '' && !hasCuda) {
-    warnings.push(W('⚠️',
-      `Device is set to "${device}" but no CUDA GPU was detected. Training will fall back to CPU automatically.`,
+  if (!['cpu', 'auto', ''].includes(device) && !hasCuda) {
+    warnings.push(W(IA.icon('circle-alert'),
+      `Device is set to "${IA.esc(device)}" but no CUDA GPU was detected. Training will fall back to CPU automatically.`,
       'warning',
-      () => { setVal('p-device', 'cpu'); onParamChange('device'); }
+      () => { setVal('p-device', 'auto'); onParamChange('device'); }
+    ));
+  }
+  if (device === 'cpu' && hasCuda) {
+    warnings.push(W(IA.icon('octagon-x'),
+      `A GPU (${IA.esc(sys.gpu_name || 'CUDA')}) is available but the device is set to CPU — training would be 10–50× slower.`,
+      'danger',
+      () => { setVal('p-device', 'auto'); onParamChange('device'); }
     ));
   }
 
@@ -1058,47 +1081,70 @@ async function beginTraining() {
 
   try {
     document.getElementById('btn-launch').disabled = true;
-    document.getElementById('btn-launch').textContent = '⏳ Starting…';
+    document.getElementById('btn-launch').textContent = 'Starting…';
 
     const r = await apiFetch('/api/train/start', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify(cfg),
     });
-
-    State.isTraining = true;
-    State.sessionId  = r.session_id;
-    State.startTime  = Date.now();
-    State.avgEpochMs = 0;
-
-    enterTrainingPhase(r.total_epochs);
-    appendLog(`[INFO] Session ${r.session_id} started — ${cfg.model} for ${r.total_epochs} epochs`);
+    startSessionUI(r);
+    appendLog(`[INFO] Session ${r.session_id} started — ${cfg.model} for ${r.total_epochs} epochs on ${r.device === 'cpu' ? 'the CPU' : `GPU ${r.device}`}`);
     showToast('Training started!', 'success');
 
   } catch (e) {
+    document.getElementById('btn-launch').textContent = 'Begin training';
+    if (e.status === 409) { showToast(e.message, 'warn'); checkExistingSession(); return; }
     showToast('Failed to start training: ' + e.message, 'error');
-    document.getElementById('btn-launch').disabled = false;
-    document.getElementById('btn-launch').textContent = '🚀 Begin Training';
+    checkLaunchReady();
   }
 }
 
-function confirmStop() {
-  openModal('⏹ Stop Training', `
-    <p style="color:var(--text-secondary);font-size:14px;margin-bottom:8px">
-      Are you sure you want to stop training? The current best weights will be saved.
-    </p>
-  `, [
-    { label: 'Cancel',      cls: 'btn-secondary', fn: () => closeModal() },
-    { label: '⏹ Stop Now', cls: 'btn-danger',    fn: () => { closeModal(); stopTraining(); } },
-  ]);
+/** Fresh UI for a new run (charts, log, results, stats) — never mix two runs. */
+function resetRunUI() {
+  show('results-container', false);
+  clearLog();
+  initCharts();
+  State.lastEpoch = 0;
+  State.avgEpochMs = 0;
+  State.best = { map50: null, box: null };
+  ['chart-map50-val', 'chart-map50-val2', 'chart-map5095-val', 'chart-prec-val', 'chart-rec-val',
+   'chart-map50-best', 'chart-map50-delta', 'chart-box-val', 'chart-cls-val', 'chart-dfl-val', 'chart-loss-val',
+   'chart-loss-best', 'chart-loss-delta', 'sc-map50', 'sc-map5095', 'sc-boxloss', 'sc-lr', 'sc-best-epoch'].forEach(id => setText(id, '—'));
+  const ce = document.getElementById('commentary-text');
+  if (ce) { ce.textContent = 'Analysis will appear every 5 epochs…'; ce.style.color = 'var(--text-muted)'; ce.style.fontStyle = 'italic'; }
+  show('commentary-epoch', false);
+  show('eta-row', false);
+  show('train-eta', false);
+}
+
+function startSessionUI(r) {
+  resetRunUI();
+  State.isTraining = true;
+  State.sessionId  = r.session_id;
+  State.startTime  = Date.now() - (r.elapsed_sec || 0) * 1000;
+  State.inPhase    = false;
+  enterTrainingPhase(r.total_epochs);
+  setText('results-session-tag', r.run_name || '');
+}
+
+async function confirmStop() {
+  const ok = await IA.confirm({
+    title: 'Stop training?',
+    message: 'Training stops after the current batch. Weights from the last completed epoch are kept in models/.',
+    confirmLabel: 'Stop training', danger: true,
+  });
+  if (ok) stopTraining();
 }
 
 async function stopTraining() {
+  show('stats-stop-card', false);
+  document.getElementById('btn-stop').disabled = true;
   try {
     await apiFetch('/api/train/stop', { method: 'POST' });
-    showToast('Stop signal sent…', 'info');
-    appendLog('[INFO] Stop requested — waiting for process to exit…');
+    showToast('Stopping after the current batch…', 'info');
   } catch (e) {
+    document.getElementById('btn-stop').disabled = false;
     showToast('Error stopping training: ' + e.message, 'error');
   }
 }
@@ -1106,22 +1152,45 @@ async function stopTraining() {
 // ── Training Phase UI ──────────────────────────────────────────────────────────
 
 function enterTrainingPhase(totalEpochs) {
+  setText('sc-total', totalEpochs);
+  if (State.inPhase) return;                  // train_status arrives every epoch — enter once
+  State.inPhase = true;
   show('console-container', true);
   document.getElementById('setup-container').style.opacity = '0.5';
   document.getElementById('setup-container').style.pointerEvents = 'none';
 
   show('train-status-banner', true);
   show('stats-stop-card', true);
+  document.getElementById('btn-stop').disabled = false;
 
   setText('sc-total', totalEpochs);
   updateEpochProgress(0, totalEpochs);
 
   const btn = document.getElementById('btn-launch');
-  btn.textContent = '⏳ Training…';
+  btn.textContent = 'Training…';
   btn.disabled = true;
 
-  State.startTime = Date.now();
+  if (!State.startTime) State.startTime = Date.now();
+  clearInterval(State.elapsedInterval);
   State.elapsedInterval = setInterval(updateElapsed, 1000);
+  updateElapsed();
+}
+
+/** Leave the running state (complete, stopped, error): stop the clock, re-enable the form. */
+function exitTrainingPhase() {
+  State.isTraining = false;
+  State.inPhase = false;
+  clearInterval(State.elapsedInterval);
+  State.elapsedInterval = null;
+  show('train-status-banner', false);
+  show('stats-stop-card', false);
+  show('eta-row', false);
+  show('train-eta', false);
+  document.getElementById('setup-container').style.opacity = '';
+  document.getElementById('setup-container').style.pointerEvents = '';
+  const btn = document.getElementById('btn-launch');
+  btn.textContent = 'Begin training';
+  checkLaunchReady();
 }
 
 function updateElapsed() {
@@ -1181,9 +1250,10 @@ function formatDuration(totalSecs) {
 
 // ── Socket.IO Event Handlers ───────────────────────────────────────────────────
 
-function onEpoch(data) {
+function onEpoch(data, replay = false) {
   const epoch   = data.epoch || 0;
-  const total   = data.total_epochs || parseInt(document.getElementById('sc-total').textContent) || 0;
+  State.lastEpoch = Math.max(State.lastEpoch, epoch);
+  const total   = data.total_epochs || data.epochs || parseInt(document.getElementById('sc-total').textContent) || 0;
   const metrics = data.metrics || {};
   const losses  = data.loss_items || [];
 
@@ -1195,23 +1265,23 @@ function onEpoch(data) {
   updateEpochProgress(epoch, total);
   updateETA(epoch, total);
 
-  const map50   = metrics['metrics/mAP50(B)']    ?? metrics['mAP50']    ?? null;
-  const map5095 = metrics['metrics/mAP50-95(B)'] ?? metrics['mAP50-95'] ?? null;
-  const prec    = metrics['metrics/precision(B)'] ?? metrics['precision'] ?? null;
-  const rec     = metrics['metrics/recall(B)']    ?? metrics['recall']    ?? null;
+  const map50   = fin(metrics['metrics/mAP50(B)']    ?? metrics['mAP50']);
+  const map5095 = fin(metrics['metrics/mAP50-95(B)'] ?? metrics['mAP50-95']);
+  const prec    = fin(metrics['metrics/precision(B)'] ?? metrics['precision']);
+  const rec     = fin(metrics['metrics/recall(B)']    ?? metrics['recall']);
 
   if (map50 !== null) {
     setText('sc-map50',       map50.toFixed(4));
     setText('chart-map50-val',  map50.toFixed(4));
     setText('chart-map50-val2', map50.toFixed(4));
-    State.charts.map50.push(map50, 0);
+    State.charts.map50.push(map50, 0, !replay);
 
     const ch = State.charts.map50;
-    const bestMap = Math.max(...ch.series[0].data);
-    setText('chart-map50-best', bestMap.toFixed(4));
+    State.best.map50 = Math.max(State.best.map50 ?? -1, map50);       // over the whole run, not just the chart window
+    setText('chart-map50-best', State.best.map50.toFixed(4));
 
     const prim = ch.series[0].data;
-    if (prim.length >= 5) {
+    if (prim.length >= 6) {
       const delta = prim[prim.length - 1] - prim[prim.length - 6];
       const sign  = delta >= 0 ? '+' : '';
       const span  = document.getElementById('chart-map50-delta');
@@ -1223,26 +1293,27 @@ function onEpoch(data) {
   }
   if (map5095 !== null) {
     setText('chart-map5095-val', map5095.toFixed(4));
-    State.charts.map50.push(map5095, 1);
+    setText('sc-map5095', map5095.toFixed(4));
+    State.charts.map50.push(map5095, 1, !replay);
   }
   if (prec !== null) { setText('chart-prec-val', prec.toFixed(3)); }
   if (rec  !== null) { setText('chart-rec-val',  rec.toFixed(3)); }
-  if (data.lr !== undefined)         { setText('sc-lr', data.lr.toExponential(2)); }
+  if (fin(data.lr) !== null)         { setText('sc-lr', data.lr.toExponential(2)); }
   if (data.best_epoch !== undefined) { setText('sc-best-epoch', data.best_epoch); }
 
-  const [boxLoss, clsLoss, dflLoss] = losses;
-  if (boxLoss !== undefined) {
+  const [boxLoss, clsLoss, dflLoss] = losses.map(fin);
+  if (boxLoss != null) {
     setText('sc-boxloss',    boxLoss.toFixed(4));
     setText('chart-box-val', boxLoss.toFixed(4));
     setText('chart-loss-val', boxLoss.toFixed(4));
-    State.charts.loss.push(boxLoss, 0);
+    State.charts.loss.push(boxLoss, 0, !replay);
 
     const lch = State.charts.loss;
-    const bestBox = Math.min(...lch.series[0].data);
-    setText('chart-loss-best', bestBox.toFixed(4));
+    State.best.box = Math.min(State.best.box ?? Infinity, boxLoss);
+    setText('chart-loss-best', State.best.box.toFixed(4));
 
     const ldata = lch.series[0].data;
-    if (ldata.length >= 5) {
+    if (ldata.length >= 6) {
       const delta = ldata[ldata.length - 1] - ldata[ldata.length - 6];
       const sign  = delta >= 0 ? '+' : '';
       const span  = document.getElementById('chart-loss-delta');
@@ -1252,13 +1323,13 @@ function onEpoch(data) {
       }
     }
   }
-  if (clsLoss !== undefined) {
+  if (clsLoss != null) {
     setText('chart-cls-val', clsLoss.toFixed(4));
-    State.charts.loss.push(clsLoss, 1);
+    State.charts.loss.push(clsLoss, 1, !replay);
   }
-  if (dflLoss !== undefined) {
+  if (dflLoss != null) {
     setText('chart-dfl-val', dflLoss.toFixed(4));
-    State.charts.loss.push(dflLoss, 2);
+    State.charts.loss.push(dflLoss, 2, !replay);
   }
 }
 
@@ -1269,19 +1340,19 @@ function showComment(text, epoch) {
   if (ep) { ep.textContent = `After epoch ${epoch}`; ep.classList.remove('hidden'); }
 }
 
-function onComplete(data) {
-  State.isTraining = false;
-  clearInterval(State.elapsedInterval);
-
-  show('train-status-banner', false);
-  show('stats-stop-card', false);
+/** live = this tab saw the run finish (toast + scroll); false = shown again after a reload. */
+function onComplete(data, live = true) {
+  const sid = data.session_id || State.sessionId || data.best_pt;
+  if (State.shownComplete === sid) return;
+  State.shownComplete = sid;
+  exitTrainingPhase();
   show('results-container', true);
 
   const m       = data.final_metrics || {};
-  const map50   = m['metrics/mAP50(B)']     ?? m['mAP50']    ?? null;
-  const map5095 = m['metrics/mAP50-95(B)']  ?? m['mAP50-95'] ?? null;
-  const prec    = m['metrics/precision(B)']  ?? null;
-  const rec     = m['metrics/recall(B)']     ?? null;
+  const map50   = fin(m['metrics/mAP50(B)']     ?? m['mAP50']);
+  const map5095 = fin(m['metrics/mAP50-95(B)']  ?? m['mAP50-95']);
+  const prec    = fin(m['metrics/precision(B)']);
+  const rec     = fin(m['metrics/recall(B)']);
 
   setText('res-map50',   map50   !== null ? map50.toFixed(4)   : '—');
   setText('res-map5095', map5095 !== null ? map5095.toFixed(4) : '—');
@@ -1289,72 +1360,95 @@ function onComplete(data) {
   setText('res-rec',     rec     !== null ? rec.toFixed(3)     : '—');
 
   const savedPath = data.saved_model_path;
-  if (savedPath) {
+  if (savedPath && data.saved_model_rel) {
     setText('res-model-path', savedPath);
-    const fname = savedPath.split(/[\\\/]/).pop();
     const dl    = document.getElementById('res-download-btn');
-    dl.href = `/api/train/models/${encodeURIComponent(fname)}`;
-    dl.setAttribute('download', fname);
+    dl.href = modelUrl(data.saved_model_rel);
+    dl.setAttribute('download', data.saved_model_rel.replace(/\//g, '_'));
     dl.style.display = '';
   } else {
     setText('res-model-path', data.best_pt || 'Model not saved — check logs');
     document.getElementById('res-download-btn').style.display = 'none';
   }
 
-  appendLog('[INFO] ✅ Training complete! Best weights saved to models/');
-  showToast('Training complete! Model saved.', 'success');
-
-  document.getElementById('setup-container').style.opacity = '';
-  document.getElementById('setup-container').style.pointerEvents = '';
-  const btn = document.getElementById('btn-launch');
-  btn.textContent = '🚀 Begin Training';
-  btn.disabled = false;
-
-  loadModelsLibrary();
+  loadRuns();
+  if (!live) return;
+  appendLog('[INFO] Training complete. Best weights saved to models/');
+  showToast('Training complete — model saved', 'success');
   document.getElementById('results-container').scrollIntoView({ behavior: 'smooth' });
 }
 
 function onTrainError(message) {
-  State.isTraining = false;
-  clearInterval(State.elapsedInterval);
+  if (!State.inPhase && !State.isTraining) return;
   appendLog(`[ERROR] ${message}`, 'error');
   showToast('Training error: ' + message, 'error');
-  show('train-status-banner', false);
-  show('stats-stop-card', false);
-
-  document.getElementById('setup-container').style.opacity = '';
-  document.getElementById('setup-container').style.pointerEvents = '';
-  const btn = document.getElementById('btn-launch');
-  btn.textContent = '🚀 Begin Training';
-  checkLaunchReady();
+  exitTrainingPhase();
+  loadRuns();
 }
 
 function syncStatus(data) {
-  if (data.status === 'running') {
+  // A status from an older session (e.g. its final message arriving late) must not touch this one
+  if (data.session_id && State.sessionId && data.session_id !== State.sessionId && !['running', 'stopping'].includes(data.status)) return;
+  if (data.status === 'running' || data.status === 'stopping') {
+    if (data.session_id && data.session_id !== State.sessionId) {
+      startSessionUI({ ...data, total_epochs: data.total_epochs || 100 });   // started elsewhere
+    }
     State.isTraining = true;
     enterTrainingPhase(data.total_epochs || 100);
     updateEpochProgress(data.epoch || 0, data.total_epochs || 100);
-    appendLog('[INFO] Reconnected — training is still in progress');
-    show('stats-stop-card', true);
+    show('stats-stop-card', data.status === 'running');
+    document.getElementById('btn-stop').disabled = data.status !== 'running';
+  } else if (data.status === 'stopped' && State.inPhase) {
+    appendLog('[INFO] Training stopped. The last completed epoch is saved — resume it from the run history.');
+    showToast('Training stopped', 'info');
+    exitTrainingPhase();
+    loadRuns();
+  } else if (data.status === 'error' && State.inPhase) {
+    onTrainError(data.error || data.message || 'Training failed');
+  } else if (data.status === 'complete' && data.final_result) {
+    onComplete({ ...data.final_result, session_id: data.session_id });
   }
 }
 
 // ── Check existing session on page load ───────────────────────────────────────
 
 async function checkExistingSession() {
+  let r;
+  try { r = await apiFetch('/api/train/status'); } catch (_) { return; }
+  if (!r.session_id || r.status === 'idle') return;
+  const active = r.status === 'running' || r.status === 'stopping';
+  // A finished run is shown again after a reload until "Train another" dismisses it
+  if (!active && State.dismissed === r.session_id) return;
   try {
-    const r = await apiFetch('/api/train/status');
-    if (r.status === 'running') {
-      State.isTraining = true;
-      State.sessionId  = r.session_id;
-      State.startTime  = Date.now() - (r.elapsed_sec || 0) * 1000;
-      enterTrainingPhase(r.total_epochs || 100);
-      updateEpochProgress(r.epoch || 0, r.total_epochs || 100);
-      show('stats-stop-card', true);
-      appendLog('[INFO] Training session already in progress — live view resumed');
-      showToast('Reconnected to active training session', 'info');
+    if (State.restoredSession !== r.session_id) {
+      // First sync for this session on this page: rebuild charts and log from the server's copy
+      State.restoredSession = r.session_id;
+      resetRunUI();
+      appendLines(r.log_tail || []);
+      (r.epoch_history || []).forEach((ep) => onEpoch(ep, true));
+      Object.values(State.charts).forEach((c) => c.render());
+    } else {
+      // Reconnect: draw only the epochs missed while offline
+      const missed = (r.epoch_history || []).filter((ep) => (ep.epoch || 0) > State.lastEpoch);
+      missed.forEach((ep) => onEpoch(ep, true));
+      if (missed.length) Object.values(State.charts).forEach((c) => c.render());
     }
-  } catch (_) {}
+  } catch (err) { console.warn('Could not restore the training view:', err); }
+
+  State.sessionId = r.session_id;
+  setText('results-session-tag', r.run_name || '');
+  if (active) {
+    State.isTraining = true;
+    State.startTime  = Date.now() - (r.elapsed_sec || 0) * 1000;
+    enterTrainingPhase(r.total_epochs || 100);
+    updateEpochProgress(r.epoch || 0, r.total_epochs || 100);
+    show('stats-stop-card', r.status === 'running');
+  } else {
+    show('console-container', true);
+    if (r.status === 'complete' && r.final_result) onComplete({ ...r.final_result, session_id: r.session_id }, false);
+    else if (r.status === 'error') appendLog(`[ERROR] ${r.error || 'Training failed'}`, 'error');
+    else if (r.status === 'stopped') appendLog('[INFO] This run was stopped. Resume it from the run history below.');
+  }
 }
 
 // ── Log Terminal ───────────────────────────────────────────────────────────────
@@ -1387,22 +1481,36 @@ function appendLog(line, forceClass) {
   el.className = 'log-line ' + (forceClass || classifyLogLine(cleanedLine));
   el.textContent = cleanedLine;
 
-  terminal.appendChild(el);
-  terminal.appendChild(document.createTextNode('\n'));
+  terminal.appendChild(el);                       // .log-line is display:block — no "\n" needed
+  trimLog(terminal);
+  if (State.autoScroll) terminal.scrollTop = terminal.scrollHeight;
+}
 
+function trimLog(terminal) {
   State.logLines++;
   if (State.logLines > 2500) {
     const lines = terminal.querySelectorAll('.log-line');
-    for (let i = 0; i < 500; i++) {
-      if (lines[i]) lines[i].nextSibling?.remove();
-      if (lines[i]) lines[i].remove();
-    }
+    for (let i = 0; i < 500 && lines[i]; i++) lines[i].remove();
     State.logLines -= 500;
   }
+}
 
-  if (State.autoScroll) {
-    terminal.scrollTop = terminal.scrollHeight;
-  }
+/** Many lines at once (reload): one DOM insert, one scroll. */
+function appendLines(lines) {
+  const terminal = document.getElementById('log-terminal');
+  if (!terminal) return;
+  const frag = document.createDocumentFragment();
+  lines.forEach((line) => {
+    const cleaned = cleanAndFormatLine(line);
+    if (line && !cleaned.trim() && line.trim()) return;
+    const el = document.createElement('span');
+    el.className = 'log-line ' + classifyLogLine(cleaned);
+    el.textContent = cleaned;
+    frag.appendChild(el);
+    State.logLines++;
+  });
+  terminal.appendChild(frag);
+  if (State.autoScroll) terminal.scrollTop = terminal.scrollHeight;
 }
 
 function classifyLogLine(line) {
@@ -1437,12 +1545,12 @@ class DetailChart {
     this.MAX_PTS  = 200;
   }
 
-  push(value, seriesIndex = 0) {
+  push(value, seriesIndex = 0, render = true) {
     const s = this.series[seriesIndex];
     if (!s) return;
     s.data.push(value);
     if (s.data.length > this.MAX_PTS) s.data.shift();
-    this.render();
+    if (render) this.render();
   }
 
   render() {
@@ -1574,58 +1682,116 @@ class DetailChart {
 
 function initCharts() {
   State.charts.map50 = new DetailChart('chart-map50', [
-    { color: '#22d3a0', label: 'mAP50',    data: [] },
-    { color: '#4f9eff', label: 'mAP50-95', data: [] },
+    { color: '#43c486', label: 'mAP50',    data: [] },
+    { color: '#62a8ea', label: 'mAP50-95', data: [] },
   ], 0, 1);
 
   State.charts.loss = new DetailChart('chart-loss', [
-    { color: '#ff9940', label: 'Box Loss', data: [] },
-    { color: '#9d92ff', label: 'Cls Loss', data: [] },
-    { color: '#f5c542', label: 'DFL Loss', data: [] },
+    { color: '#ec8b43', label: 'Box Loss', data: [] },
+    { color: '#a08ae8', label: 'Cls Loss', data: [] },
+    { color: '#e3b341', label: 'DFL Loss', data: [] },
   ], 0, null);
 }
 
-// ── Models Library ─────────────────────────────────────────────────────────────
+// ── Run history ────────────────────────────────────────────────────────────────
 
-async function loadModelsLibrary() {
+function modelUrl(rel) {
+  // Authenticated by the media cookie — no token in the URL
+  return `/api/train/models/${rel.split('/').map(encodeURIComponent).join('/')}`;
+}
+
+const metric = (m, k) => (fin(m?.[k]) !== null ? m[k].toFixed(3) : '—');
+const baseName = (p) => String(p || '?').split(/[\\/]/).pop();
+
+async function loadRuns() {
+  const list = document.getElementById('runs-list');
   try {
-    const r = await apiFetch('/api/train/models');
-    const list = document.getElementById('models-library-list');
-    if (!r.models || r.models.length === 0) {
-      list.innerHTML = '<div class="text-muted text-sm" style="padding:12px;text-align:center">No models saved yet.</div>';
-      return;
-    }
-    list.innerHTML = r.models.map(m => `
-      <div class="saved-model-row">
-        <span style="font-size:18px">🧠</span>
-        <div class="saved-model-name" title="${m.path}">${m.name}</div>
-        <span class="saved-model-meta">${m.size_mb} MB</span>
-        <a href="/api/train/models/${m.name.split('/').map(encodeURIComponent).join('/')}" download="${m.name.split('/').pop()}"
-           class="btn btn-secondary btn-sm">⬇</a>
-      </div>
-    `).join('');
-  } catch (_) {}
+    const { runs } = await apiFetch('/api/train/runs');
+    State.runs = runs;
+    if (!runs.length) { list.innerHTML = '<div class="text-muted text-sm" style="padding:12px;text-align:center">No runs yet.</div>'; return; }
+    list.innerHTML = runs.map((r) => {
+      const m = r.metrics || {};
+      const when = IA.fmtDate(r.finished_at || r.started_at);
+      const dur = r.config?.train_seconds ? ` · ${formatDuration(r.config.train_seconds)}` : '';
+      const where = r.source === 'cloud' ? `${IA.esc(r.config?.environment || 'cloud')}${r.config?.device ? ` · ${IA.esc(r.config.device)}` : ''}` : '';
+      return `<div class="run-row" data-id="${r.id}">
+        <div style="min-width:0">
+          <div class="run-name" title="${IA.esc(r.name)}">${IA.esc(r.name)}<span class="run-badge ${r.source === 'cloud' ? 'cloud' : ''}">${r.source === 'cloud' ? 'cloud' : 'local'}</span>${r.status !== 'complete' && r.status !== 'imported' ? `<span class="run-badge ${IA.esc(r.status)}">${IA.esc(r.status)}</span>` : ''}</div>
+          <div class="run-meta"><span>mAP50 <b>${metric(m, 'metrics/mAP50(B)')}</b></span><span>mAP50-95 <b>${metric(m, 'metrics/mAP50-95(B)')}</b></span>
+            <span>${IA.esc(baseName(r.model))}</span><span>${r.epochs_done || 0}${r.total_epochs ? ` / ${r.total_epochs}` : ''} epochs</span>
+            ${r.dataset ? `<span>${IA.esc(r.dataset)}</span>` : ''}${where ? `<span>${where}</span>` : ''}<span>${IA.esc(when)}${dur}</span></div>
+          ${r.error ? `<div class="text-sm" style="color:var(--red);margin-top:4px">${IA.esc(r.error.slice(0, 300))}</div>` : ''}
+        </div>
+        <div class="run-actions">
+          ${r.can_resume ? `<button class="btn btn-secondary btn-sm" data-act="resume">${IA.icon('play')}Resume</button>` : ''}
+          ${r.best_pt ? `<button class="btn btn-ghost btn-sm" data-act="finetune" data-tip="Start a new run from these weights">${IA.icon('repeat-2')}Fine-tune</button>` : ''}
+          ${(r.plots?.length || Object.keys(m.per_class || {}).length) ? `<button class="btn btn-ghost btn-sm" data-act="details">${IA.icon('gauge')}Details</button>` : ''}
+          ${r.best_pt ? `<a class="btn btn-sm" href="${modelUrl(r.best_pt)}" download="${IA.esc(r.name)}_best.pt" aria-label="Download best.pt">${IA.icon('download')}</a>` : ''}
+          <button class="btn btn-ghost btn-sm btn-icon" data-act="delete" aria-label="Delete run">${IA.icon('trash-2')}</button>
+        </div></div>`;
+    }).join('');
+  } catch (e) {
+    list.innerHTML = `<div class="text-muted text-sm" style="padding:12px;text-align:center">Could not load runs: ${IA.esc(e.message)}</div>`;
+  }
+}
+
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('#runs-list [data-act]');
+  if (!btn) return;
+  const run = State.runs?.find((r) => r.id === btn.closest('.run-row').dataset.id);
+  if (!run) return;
+  const act = btn.dataset.act;
+  if (act === 'resume') {
+    try { const r = await apiFetch(`/api/train/runs/${run.id}/resume`, { method: 'POST' }); startSessionUI(r); showToast(`Resuming ${run.name}`, 'success'); }
+    catch (err) { showToast(err.message, 'error'); }
+  } else if (act === 'finetune') {
+    const input = document.getElementById('custom-model-input');
+    input.value = run.best_pt;
+    onCustomModelInput();
+    document.getElementById('step-model').scrollIntoView({ behavior: 'smooth' });
+    showToast('New runs will start from this model — pick a dataset and press Begin', 'info');
+  } else if (act === 'details') {
+    showRunDetails(run);
+  } else if (act === 'delete') {
+    const ok = await IA.confirm({ title: `Delete ${run.name}?`, message: 'Its weights, plots and history are removed from disk. This cannot be undone.', confirmLabel: 'Delete run', danger: true });
+    if (!ok) return;
+    try { await apiFetch(`/api/train/runs/${run.id}`, { method: 'DELETE' }); loadRuns(); } catch (err) { showToast(err.message, 'error'); }
+  }
+});
+
+function showRunDetails(run) {
+  const per = run.metrics?.per_class || {};
+  const rows = Object.entries(per).sort((a, b) => (a[1]['mAP50-95'] ?? 0) - (b[1]['mAP50-95'] ?? 0));
+  const table = rows.length ? `<div class="table-wrap"><table class="table"><thead><tr><th>Class</th><th>Precision</th><th>Recall</th><th>mAP50</th><th>mAP50-95</th></tr></thead><tbody>
+    ${rows.map(([c, v]) => `<tr><td class="strong">${IA.esc(c)}</td><td>${metric(v, 'precision')}</td><td>${metric(v, 'recall')}</td><td>${metric(v, 'mAP50')}</td><td>${metric(v, 'mAP50-95')}</td></tr>`).join('')}
+    </tbody></table></div><p class="small muted">Weakest classes first — these need more (or cleaner) labels.</p>` : '';
+  const plots = (run.plots || []).map((p) => `<figure><a href="/api/train/runs/${run.id}/files/${p}" target="_blank" rel="noopener"><img src="/api/train/runs/${run.id}/files/${p}" alt="" loading="lazy"/></a><figcaption>${IA.esc(p.split('/').pop())}</figcaption></figure>`).join('');
+  IA.modal({ title: run.name, sub: `${run.source === 'cloud' ? 'Cloud' : 'Local'} run · ${baseName(run.model)}`, size: 'wide',
+    body: `${table}${plots ? `<div class="plot-grid">${plots}</div>` : ''}`, actions: [{ label: 'Close', variant: 'btn-primary' }] });
+}
+
+async function importCloudResult(e) {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  const fd = new FormData();
+  fd.append('file', file);
+  showToast(`Importing ${file.name}…`, 'info');
+  try {
+    const r = await IA.request('POST', '/api/train/import-result', fd);
+    const map = fin(r.metrics?.['metrics/mAP50(B)']);
+    showToast(`Imported ${r.run_name}${map !== null ? ` — mAP50 ${map.toFixed(3)}` : ''}. It can pre-label frames under Model assist.`, 'success');
+    loadRuns();
+  } catch (err) { showToast(`Import failed: ${err.message}`, 'error'); }
 }
 
 function trainAnother() {
-  show('results-container', false);
+  State.dismissed = State.sessionId;
+  IA.store.set('ia_train_dismissed', State.dismissed);
+  resetRunUI();
   show('console-container', false);
-  clearLog();
   State.isTraining   = false;
   State.sessionId    = null;
-  State.avgEpochMs   = 0;
-
-  // Hide ETA rows
-  const etaRow  = document.getElementById('eta-row');
-  const bannerEta = document.getElementById('train-eta');
-  if (etaRow)    etaRow.classList.add('hidden');
-  if (bannerEta) bannerEta.classList.add('hidden');
-
-  initCharts();
-  ['chart-map50-val', 'chart-map50-val2', 'chart-map5095-val', 'chart-prec-val', 'chart-rec-val',
-   'chart-map50-best', 'chart-map50-delta',
-   'chart-box-val', 'chart-cls-val', 'chart-dfl-val', 'chart-loss-val',
-   'chart-loss-best', 'chart-loss-delta'].forEach(id => setText(id, '—'));
   checkLaunchReady();
 }
 
@@ -1645,59 +1811,24 @@ function updateStepNum(num, state) {
   if (state) el.classList.add(state);
 }
 
-// ── Modal helpers ──────────────────────────────────────────────────────────────
-
-function openModal(title, bodyHtml, actions) {
-  document.getElementById('modal-title').textContent = title;
-  document.getElementById('modal-body').innerHTML    = bodyHtml;
-  const actionsEl = document.getElementById('modal-actions');
-  actionsEl.innerHTML = '';
-  actions.forEach(a => {
-    const btn = document.createElement('button');
-    btn.className = 'btn ' + a.cls;
-    btn.textContent = a.label;
-    btn.onclick = a.fn;
-    actionsEl.appendChild(btn);
-  });
-  document.getElementById('modal-overlay').classList.remove('hidden');
-}
-
-function closeModal(e) {
-  if (e && e.target !== document.getElementById('modal-overlay')) return;
-  document.getElementById('modal-overlay').classList.add('hidden');
-}
-
 // ── Toast ──────────────────────────────────────────────────────────────────────
 
 function showToast(msg, type = 'info') {
-  const icons = { success: '✅', error: '❌', info: 'ℹ️', warn: '⚠️' };
-  const container = document.getElementById('toast-container');
-  const toast = document.createElement('div');
-  toast.className = `toast ${type}`;
-  toast.innerHTML = `<span class="toast-icon">${icons[type] || 'ℹ️'}</span><span>${msg}</span>`;
-  container.appendChild(toast);
-  setTimeout(() => {
-    toast.style.animation = 'toast-out 300ms ease forwards';
-    setTimeout(() => toast.remove(), 300);
-  }, 3500);
+  IA.toast(msg, type);
 }
 
 // ── Utilities ──────────────────────────────────────────────────────────────────
 
-async function apiFetch(url, opts = {}) {
-  const token = localStorage.getItem('ia_token');
-  const res = await fetch(url, {
-    ...opts,
-    headers: {
-      ...(opts.headers || {}),
-      'Authorization': `Bearer ${token}`,
-    },
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.detail || `HTTP ${res.status}`);
-  }
-  return res.json();
+/** Thin adapter over IA.request (shared auth, error and network handling). */
+function apiFetch(url, opts = {}) {
+  const body = opts.body !== undefined ? JSON.parse(opts.body) : undefined;
+  return IA.request(opts.method || 'GET', url, body);
+}
+
+/** Parse a number input; keeps real zeros (workers=0, mosaic=0 …) instead of the default. */
+function num(value, fallback) {
+  const v = parseFloat(value);
+  return Number.isFinite(v) ? v : fallback;
 }
 
 function setText(id, text) {
@@ -1711,10 +1842,4 @@ function show(id, visible) {
   el.classList.toggle('hidden', !visible);
 }
 
-// ── IA namespace ───────────────────────────────────────────────────────────────
-const IA = {
-  logout() {
-    localStorage.removeItem('ia_token');
-    window.location.href = '/login';
-  },
-};
+

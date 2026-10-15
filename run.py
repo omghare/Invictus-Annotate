@@ -1,10 +1,11 @@
 """
 Invictus Annotate — Entry Point
 Run with: python run.py
-Accessible on LAN at: http://<your-ip>:8000
+Accessible on LAN at: http://<your-ip>:8000   (set HOST=127.0.0.1 in .env for this machine only)
 """
 import uvicorn
-from app.config import PORT
+from app.config import HOST, PORT
+from app.logsafe import uvicorn_log_config
 
 if __name__ == "__main__":
     import socket
@@ -18,18 +19,21 @@ if __name__ == "__main__":
     print("  Invictus Annotate")
     print("=" * 55)
     print(f"  Local:   http://localhost:{PORT}")
-    print(f"  Network: http://{local_ip}:{PORT}")
+    if HOST not in ("127.0.0.1", "localhost"):
+        print(f"  Network: http://{local_ip}:{PORT}")
     print("=" * 55)
-    print("  Default admin: admin / admin123")
-    print("  (Change password after first login)")
+    print("  First run: sign in as admin / admin123 — you will be")
+    print("  asked to choose a new password straight away.")
+    print("  After updating the code, restart this server.")
     print("=" * 55)
 
     uvicorn.run(
         "app.main:socket_app",
-        host="0.0.0.0",
+        host=HOST,
         port=PORT,
         reload=False,
         workers=1,          # Single worker required for SQLite WAL
         log_level="info",
+        log_config=uvicorn_log_config(),
         timeout_graceful_shutdown=2,
     )

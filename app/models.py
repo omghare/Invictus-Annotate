@@ -2,8 +2,19 @@
 Pydantic models for request/response validation.
 Updated for multi-project support.
 """
-from typing import List, Optional
-from pydantic import BaseModel, field_validator
+from typing import List, Literal, Optional
+from pydantic import BaseModel, Field, field_validator
+
+from app.config import MIN_PASSWORD_LEN
+
+
+def check_password(v: str) -> str:
+    """Shared rule for every new password (bcrypt only reads the first 72 bytes)."""
+    if len(v) < MIN_PASSWORD_LEN:
+        raise ValueError(f"Password must be at least {MIN_PASSWORD_LEN} characters")
+    if len(v.encode("utf-8")) > 72:
+        raise ValueError("Password is too long (max 72 bytes)")
+    return v
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -18,12 +29,31 @@ class TokenResponse(BaseModel):
     user_id: str
     username: str
     is_admin: bool
+    must_change_password: bool = False
 
 class UserOut(BaseModel):
     id: str
     username: str
     is_admin: bool
     created_at: str
+    must_change_password: bool = False
+
+class ChangeOwnPasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def password_valid(cls, v: str) -> str:
+        return check_password(v)
+
+class SetPasswordRequest(BaseModel):
+    password: str
+
+    @field_validator("password")
+    @classmethod
+    def password_valid(cls, v: str) -> str:
+        return check_password(v)
 
 class CreateUserRequest(BaseModel):
     username: str
@@ -41,9 +71,7 @@ class CreateUserRequest(BaseModel):
     @field_validator("password")
     @classmethod
     def password_valid(cls, v: str) -> str:
-        if len(v) < 4:
-            raise ValueError("Password must be at least 4 characters")
-        return v
+        return check_password(v)
 
 
 # ── Project ──────────────────────────────────────────────────────────────────
@@ -72,6 +100,8 @@ class CreateProjectRequest(BaseModel):
 
 class UpdateClassesRequest(BaseModel):
     classes: List[str]
+    # {old_name: new_name} — existing boxes follow the rename instead of becoming orphans
+    renames: dict[str, str] = {}
 
     @field_validator("classes")
     @classmethod
@@ -79,7 +109,7 @@ class UpdateClassesRequest(BaseModel):
         v = [c.strip() for c in v if c.strip()]
         if len(v) == 0:
             raise ValueError("At least one class required")
-        if len(v) != len(set(v)):\
+        if len(v) != len(set(v)):
             raise ValueError("Class names must be unique")
         return v
 
@@ -111,6 +141,7 @@ class ProjectListItem(BaseModel):
     ready_count: int
     exported_count: int
     unassigned_count: int
+    stats: dict = {}          # raw image count per state (for the stacked progress bar)
 
 class ImportResult(BaseModel):
     imported: int
@@ -136,6 +167,11 @@ class ImageOut(BaseModel):
     state: str
     assigned_to: Optional[str]
     assigned_username: Optional[str]
+    seq: Optional[int] = None
+    seq_group: Optional[str] = None
+    box_count: int = 0
+    is_background: bool = False
+    review_status: Optional[str] = None
 
 class PaginatedImages(BaseModel):
     """Paginated image list response."""
@@ -161,6 +197,11 @@ class AssignRequest(BaseModel):
 class AutoAssignRequest(BaseModel):
     user_ids: List[str]
     image_ids: Optional[List[str]] = None
+    # contiguous = consecutive frame ranges per user (keeps sequences together)
+    strategy: Literal["contiguous", "round_robin"] = "contiguous"
+
+class UnassignRequest(BaseModel):
+    image_ids: List[str]
 
 class RemoveUserFromProjectRequest(BaseModel):
     keep_annotated: bool
@@ -168,23 +209,32 @@ class RemoveUserFromProjectRequest(BaseModel):
 
 # ── Annotations ──────────────────────────────────────────────────────────────
 
+AnnotationSource = Literal["manual", "carried", "propagated", "interpolated", "tracked", "model"]
+
 class BoundingBox(BaseModel):
-    class_id: int
+    class_id: int = -1
     class_name: str
-    x: int
-    y: int
-    w: int
-    h: int
+    x: float
+    y: float
+    w: float
+    h: float
+    source: AnnotationSource = "manual"
+    track_id: Optional[str] = Field(None, max_length=32)
+    confidence: Optional[float] = Field(None, ge=0, le=1)
 
     @field_validator("w", "h")
     @classmethod
-    def positive(cls, v: int) -> int:
-        if v < 1:
+    def positive(cls, v: float) -> float:
+        if v <= 0:
             raise ValueError("Width and height must be positive")
         return v
 
 class SaveAnnotationsRequest(BaseModel):
     annotations: List[BoundingBox]
+    # True = "this frame intentionally has no objects" (a YOLO background image)
+    is_background: bool = False
+    # The frame version the client loaded; a newer one on the server means someone else saved → 409
+    base_version: Optional[int] = None
 
 class AnnotationOut(BaseModel):
     id: str
@@ -195,6 +245,9 @@ class AnnotationOut(BaseModel):
     y: int
     w: int
     h: int
+    source: str = "manual"
+    track_id: Optional[str] = None
+    confidence: Optional[float] = None
 
 class ImageAnnotationsResponse(BaseModel):
     image_id: str
@@ -202,6 +255,14 @@ class ImageAnnotationsResponse(BaseModel):
     width: int
     height: int
     state: str
+    is_background: bool = False
+    dropped: int = 0
+    file_missing: bool = False
+    filepath: Optional[str] = None      # only sent to admins (it is a path on the server)
+    version: int = 0
+    review_status: Optional[str] = None
+    review_note: Optional[str] = None
+    reviewed_by: Optional[str] = None   # username
     annotations: List[AnnotationOut]
 
 
@@ -212,6 +273,11 @@ class ExportRequest(BaseModel):
     valid_ratio: float
     test_ratio: float
     include_test: bool = True
+    # Keep runs of consecutive frames in the same split (prevents train/val leakage)
+    group_sequences: bool = True
+    seed: Optional[int] = None
+    # Only frames a reviewer approved (see the Review section)
+    only_approved: bool = False
 
     @field_validator("train_ratio", "valid_ratio", "test_ratio")
     @classmethod
@@ -233,3 +299,5 @@ class ExportResult(BaseModel):
     test: int
     orphan_warnings: List[str]
     output_path: str
+    seed: Optional[int] = None
+    linked: int = 0          # images hard-linked instead of copied (no extra disk space)

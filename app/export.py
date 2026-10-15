@@ -1,74 +1,146 @@
 """
 Export — per-project YOLO dataset generation with data.yaml.
-Each project exports to dataset/{project_id}/ to prevent collisions.
+Each export writes a new folder dataset/{project name}_dataset[ (n)]/.
+
+Images are hard-linked into the export when it is on the same drive as the originals
+(an export then costs almost no extra disk space); otherwise they are copied. The same
+writer feeds the zip-based cloud training bundles (app/cloud.py).
 """
+import asyncio
 import json
-import math
+import os
 import random
 import shutil
+import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional
 
 import aiosqlite
-from fastapi import APIRouter, Depends, HTTPException
+import yaml
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.auth import get_admin_user
+from app.common import chunks, get_project_or_404, placeholders, project_stats
 from app.config import DATASET_DIR
-from app.database import get_db, now_iso
+from app.database import get_db
 from app.models import ExportPreview, ExportRequest, ExportResult
-from app.socket_manager import emit_export_progress, emit_stats, emit_state_change
+from app.seq_utils import split_counts
+from app.socket_manager import emit_export_progress, emit_state_change_bulk, emit_stats
 
 router = APIRouter(tags=["export"])
 
-
-def _split_list(items: list, train_r: float, valid_r: float, test_r: float, include_test: bool) -> Tuple[list, list, list]:
-    """Randomly split items according to ratios."""
-    lst = list(items)
-    random.shuffle(lst)
-    n = len(lst)
-
-    if not include_test or test_r == 0:
-        split_valid = math.ceil(n * valid_r)
-        valid_part  = lst[:split_valid]
-        train_part  = lst[split_valid:]
-        return train_part, valid_part, []
-    else:
-        split_test  = math.ceil(n * test_r)
-        split_valid = math.ceil(n * valid_r)
-        test_part   = lst[:split_test]
-        valid_part  = lst[split_test: split_test + split_valid]
-        train_part  = lst[split_test + split_valid:]
-        return train_part, valid_part, test_part
+SEQUENCE_CHUNK = 25   # consecutive frames kept together when group_sequences is on
+_export_lock = asyncio.Lock()    # two exports at once would pick the same output folder
 
 
-async def _get_stats_dict(project_id: str, db: aiosqlite.Connection) -> dict:
+# ── Splitting ─────────────────────────────────────────────────────────────────
+
+def plan_split(images: list[dict], ratios: list[float], group_sequences: bool, seed: int) -> list[list[dict]]:
+    """
+    Split images into [train, valid, test] following ratios (largest-remainder rounding,
+    train always >= 1). With group_sequences, runs of up to SEQUENCE_CHUNK consecutive
+    frames from the same folder/video stay in one split so near-identical neighbours do
+    not leak between train and validation.
+    """
+    rng = random.Random(seed)
+    n = len(images)
+    targets = split_counts(n, ratios)
+
+    if not group_sequences:
+        lst = list(images)
+        rng.shuffle(lst)
+        out, start = [], 0
+        for t in targets:
+            out.append(lst[start:start + t])
+            start += t
+        return _ensure_nonempty(out, ratios)
+
+    ordered = sorted(images, key=lambda i: (i.get("seq_group") or "", i.get("seq") or 0, i["filename"]))
+    # Small datasets need small blocks, otherwise one block can swallow the whole validation share
+    chunk = max(1, min(SEQUENCE_CHUNK, n // 20))
+    blocks: list[list[dict]] = []
+    for img in ordered:
+        if blocks and len(blocks[-1]) < chunk and blocks[-1][-1].get("seq_group") == img.get("seq_group"):
+            blocks[-1].append(img)
+        else:
+            blocks.append([img])
+    rng.shuffle(blocks)
+
+    out: list[list[dict]] = [[] for _ in ratios]
+    for block in blocks:
+        # Give the block to the split furthest below its target (ties → train)
+        deficits = [targets[i] - len(out[i]) for i in range(len(ratios))]
+        best = max(range(len(ratios)), key=lambda i: (deficits[i], -i))
+        out[best].extend(block)
+    if n and not out[0]:
+        donor = max(range(1, len(out)), key=lambda i: len(out[i]))
+        out[0].append(out[donor].pop())
+    return _ensure_nonempty(out, ratios)
+
+
+def _ensure_nonempty(parts: list[list[dict]], ratios: list[float]) -> list[list[dict]]:
+    """A split that was asked for (ratio > 0) gets at least one image when possible —
+    YOLO refuses to train with an empty validation folder."""
+    for i in range(1, len(parts)):
+        if ratios[i] > 0 and not parts[i] and len(parts[0]) > 1:
+            parts[i].append(parts[0].pop())
+    return parts
+
+
+def _ratios(train: float, valid: float, test: float, include_test: bool) -> list[float]:
+    return [train, valid, test] if include_test else [train, valid, 0.0]
+
+
+# ── data.yaml ─────────────────────────────────────────────────────────────────
+
+def build_data_yaml(classes: List[str], include_test: bool, dataset_path: Optional[str] = None) -> str:
+    """
+    YOLO-compatible data.yaml (safe for class names containing quotes / colons).
+    No `path:` key — Ultralytics then resolves the splits relative to the yaml file itself,
+    so the folder can be moved or zipped (a relative `path:` would resolve against the
+    working directory instead).
+    """
+    data = {"train": "train/images", "val": "valid/images"}
+    if include_test:
+        data["test"] = "test/images"
+    data["nc"] = len(classes)
+    data["names"] = list(classes)
+    head = f"# Exported by Invictus Annotate to {dataset_path}\n" if dataset_path else ""
+    return head + yaml.safe_dump(data, sort_keys=False, allow_unicode=True, default_flow_style=None)
+
+
+def _safe_dir_name(name: str) -> str:
+    return "".join(c if c.isalnum() or c in (" ", "_", "-") else "_" for c in name).strip() or "project"
+
+
+def _next_dataset_dir(project_name: str) -> Path:
+    base = f"{_safe_dir_name(project_name)}_dataset"
+    candidate = DATASET_DIR / base
+    counter = 1
+    while candidate.exists():
+        candidate = DATASET_DIR / f"{base} ({counter})"
+        counter += 1
+    return candidate
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+async def _exportable_images(project_id: str, db: aiosqlite.Connection, only_approved: bool = False) -> list[dict]:
+    approved = " AND review_status = 'approved'" if only_approved else ""
     cur = await db.execute(
-        "SELECT state, COUNT(*) AS cnt FROM images WHERE project_id=? GROUP BY state",
+        "SELECT id, filename, filepath, width, height, seq, seq_group FROM images "
+        f"WHERE project_id=? AND state IN ('ready_for_export', 'exported'){approved} ORDER BY COALESCE(seq,0), filename",
         (project_id,),
     )
-    rows = await cur.fetchall()
-    counts = {r["state"]: r["cnt"] for r in rows}
-    total_cur = await db.execute(
-        "SELECT COUNT(*) AS cnt FROM images WHERE project_id=?", (project_id,)
-    )
-    total_row = await total_cur.fetchone()
-    return {
-        "total":            total_row["cnt"],
-        "unassigned":       counts.get("unassigned", 0),
-        "assigned":         counts.get("assigned", 0),
-        "unannotated":      counts.get("unannotated", 0),
-        "annotated":        counts.get("annotated", 0),
-        "ready_for_export": counts.get("ready_for_export", 0),
-        "exported":         counts.get("exported", 0),
-    }
-
-
-async def _get_project_or_404(project_id: str, db: aiosqlite.Connection) -> dict:
-    cur = await db.execute("SELECT * FROM project WHERE id = ?", (project_id,))
-    row = await cur.fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Project not found")
-    return dict(row)
+    seen, images = set(), []
+    for r in await cur.fetchall():
+        img = dict(r)
+        key = str(Path(img["filepath"]).resolve()) if img["filepath"] else img["filename"]
+        if key not in seen:
+            seen.add(key)
+            images.append(img)
+    return images
 
 
 @router.get("/projects/{project_id}/export/preview", response_model=ExportPreview)
@@ -78,31 +150,200 @@ async def export_preview(
     valid_ratio: float = 0.1,
     test_ratio:  float = 0.1,
     include_test: bool = True,
+    group_sequences: bool = True,
+    only_approved: bool = False,
     db: aiosqlite.Connection = Depends(get_db),
     _admin: dict = Depends(get_admin_user),
 ):
-    await _get_project_or_404(project_id, db)
-
-    cur = await db.execute(
-        "SELECT filepath, filename FROM images WHERE project_id=? AND state IN ('ready_for_export', 'exported')",
-        (project_id,),
-    )
-    rows = await cur.fetchall()
-    seen = set()
-    for r in rows:
-        norm_p = str(Path(r["filepath"]).resolve()) if r["filepath"] else r["filename"]
-        seen.add(norm_p)
-    total = len(seen)
-
-    train_lst, valid_lst, test_lst = _split_list(
-        list(range(total)), train_ratio, valid_ratio, test_ratio, include_test
-    )
+    await get_project_or_404(project_id, db)
+    images = await _exportable_images(project_id, db, only_approved)
+    parts = plan_split(images, _ratios(train_ratio, valid_ratio, test_ratio, include_test), group_sequences, seed=0)
     return ExportPreview(
-        total_ready=total,
-        train_count=len(train_lst),
-        valid_count=len(valid_lst),
-        test_count=len(test_lst),
+        total_ready=len(images),
+        train_count=len(parts[0]),
+        valid_count=len(parts[1]),
+        test_count=len(parts[2]),
     )
+
+
+@router.get("/projects/{project_id}/export/yaml-preview")
+async def export_yaml_preview(
+    project_id: str,
+    include_test: bool = Query(True),
+    db: aiosqlite.Connection = Depends(get_db),
+    _admin: dict = Depends(get_admin_user),
+):
+    """The exact data.yaml an export would write (path shows the next output folder)."""
+    proj = await get_project_or_404(project_id, db)
+    target = _next_dataset_dir(proj["name"])
+    return {"yaml": build_data_yaml(proj["classes"], include_test, target.as_posix()),
+            "output_path": str(target)}
+
+
+class FolderWriter:
+    """Writes the dataset into a folder; images are hard-linked when possible."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.linked = 0
+        self.copied = 0
+
+    def add_image(self, src: Path, rel: str) -> None:
+        dst = self.root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(src, dst)                 # same NTFS/ext4 volume → no extra space
+            self.linked += 1
+        except OSError:
+            shutil.copy2(src, dst)
+            self.copied += 1
+
+    def add_text(self, rel: str, text: str) -> None:
+        dst = self.root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(text, encoding="utf-8")
+
+    def add_dir(self, rel: str) -> None:
+        (self.root / rel).mkdir(parents=True, exist_ok=True)
+
+
+class ZipWriter:
+    """Writes the dataset straight into a zip (images stored, text compressed)."""
+
+    def __init__(self, zf: zipfile.ZipFile, prefix: str = ""):
+        self.zf = zf
+        self.prefix = prefix
+        self.linked = 0
+        self.copied = 0
+
+    def add_image(self, src: Path, rel: str) -> None:
+        self.zf.write(src, self.prefix + rel, compress_type=zipfile.ZIP_STORED)   # JPG/PNG are compressed already
+        self.copied += 1
+
+    def add_text(self, rel: str, text: str) -> None:
+        self.zf.writestr(self.prefix + rel, text, compress_type=zipfile.ZIP_DEFLATED)
+
+    def add_dir(self, rel: str) -> None:
+        self.zf.writestr(self.prefix + rel.rstrip("/") + "/", "")
+
+
+def yolo_label_lines(anns: list[dict], classes: list[str], W: int, H: int, filename: str,
+                     warnings: list[str]) -> list[str]:
+    W, H = max(1, W), max(1, H)
+    lines = []
+    for ann in anns:
+        if ann["class_name"] not in classes:
+            warnings.append(f"Skipped box in {filename}: class '{ann['class_name']}' not in project classes")
+            continue
+        # Clip in corner space, then normalise
+        x1 = min(max(ann["x"], 0), W); y1 = min(max(ann["y"], 0), H)
+        x2 = min(max(ann["x"] + ann["w"], 0), W); y2 = min(max(ann["y"] + ann["h"], 0), H)
+        if x2 - x1 < 1 or y2 - y1 < 1:
+            continue
+        cid = classes.index(ann["class_name"])
+        lines.append(f"{cid} {(x1 + x2) / 2 / W:.6f} {(y1 + y2) / 2 / H:.6f} {(x2 - x1) / W:.6f} {(y2 - y1) / H:.6f}")
+    return lines
+
+
+def write_dataset(
+    writer,
+    split_plan: list[tuple[str, list[dict]]],
+    labels: dict[str, list[dict]],
+    classes: list[str],
+    progress,
+) -> tuple[list[str], dict, list[str]]:
+    """Blocking file work — runs in a thread. Returns (exported_ids, counts, warnings)."""
+    warnings: list[str] = []
+    exported_ids: list[str] = []
+    counts = {name: 0 for name, _ in split_plan}
+    used_stems: set[str] = set()
+    total = sum(len(items) for _, items in split_plan)
+    done = 0
+    for split_name, _ in split_plan:           # YOLO wants every listed split folder to exist
+        for sub in ("images", "labels"):
+            writer.add_dir(f"{split_name}/{sub}")
+
+    for split_name, items in split_plan:
+        for img in items:
+            done += 1
+            src = Path(img["filepath"])
+            if not src.exists():
+                warnings.append(f"File not found on disk: {img['filename']} ({src})")
+                progress(done, total)
+                continue
+
+            # Unique stem per dataset (a.jpg and a.png would otherwise share a.txt)
+            stem, ext = Path(img["filename"]).stem, Path(img["filename"]).suffix
+            if stem in used_stems:
+                stem = f"{stem}_{img['id'][:8]}"
+            used_stems.add(stem)
+            writer.add_image(src, f"{split_name}/images/{stem}{ext}")
+            lines = yolo_label_lines(labels.get(img["id"], []), classes, img["width"], img["height"],
+                                     img["filename"], warnings)
+            writer.add_text(f"{split_name}/labels/{stem}.txt", "\n".join(lines))
+
+            exported_ids.append(img["id"])
+            counts[split_name] += 1
+            progress(done, total)
+    return exported_ids, counts, warnings
+
+
+async def prepare_export(project_id: str, body: ExportRequest, db: aiosqlite.Connection):
+    """Validate ratios, pick images, split them and load their boxes. Shared with cloud bundles."""
+    total_r = body.train_ratio + body.valid_ratio + (body.test_ratio if body.include_test else 0)
+    if abs(total_r - 1.0) > 0.01:
+        raise HTTPException(status_code=400, detail=f"Ratios must sum to 100% (got {total_r * 100:.0f}%)")
+
+    proj = await get_project_or_404(project_id, db)
+    images = await _exportable_images(project_id, db, body.only_approved)
+    if not images:
+        detail = "No approved images in the dataset yet" if body.only_approved else "No images ready for export in this project"
+        raise HTTPException(status_code=400, detail=detail)
+
+    seed = body.seed if body.seed is not None else random.randrange(1_000_000)
+    parts = plan_split(
+        images, _ratios(body.train_ratio, body.valid_ratio, body.test_ratio, body.include_test),
+        body.group_sequences, seed,
+    )
+    split_plan = [("train", parts[0]), ("valid", parts[1])]
+    if body.include_test:
+        split_plan.append(("test", parts[2]))
+
+    labels: dict[str, list[dict]] = {}
+    for batch in chunks([i["id"] for i in images]):
+        cur = await db.execute(
+            f"SELECT image_id, class_name, x, y, w, h FROM annotations WHERE image_id IN ({placeholders(len(batch))})",
+            batch,
+        )
+        for r in await cur.fetchall():
+            labels.setdefault(r["image_id"], []).append(dict(r))
+    return proj, split_plan, labels, seed
+
+
+def manifest(project_id: str, proj: dict, body: ExportRequest, seed: int, counts: dict, n: int) -> dict:
+    return {
+        "project_id": project_id, "project_name": proj["name"], "classes": proj["classes"],
+        "exported_at": datetime.now(timezone.utc).isoformat(), "seed": seed,
+        "group_sequences": body.group_sequences, "only_approved": body.only_approved,
+        "counts": counts, "images": n,
+    }
+
+
+async def mark_exported(db: aiosqlite.Connection, project_id: str, exported_ids: list[str], summary: str) -> None:
+    changes: list[dict] = []
+    for batch in chunks(exported_ids):
+        cur = await db.execute(
+            f"UPDATE images SET state='exported' WHERE state != 'exported' "
+            f"AND id IN ({placeholders(len(batch))}) RETURNING id, assigned_to",
+            batch,
+        )
+        changes.extend(
+            {"image_id": r["id"], "new_state": "exported", "assigned_to": r["assigned_to"]}
+            for r in await cur.fetchall()
+        )
+    await db.commit()
+    await emit_state_change_bulk(changes, project_id, summary)
+    await emit_stats(await project_stats(project_id, db), project_id)
 
 
 @router.post("/projects/{project_id}/export", response_model=ExportResult)
@@ -112,179 +353,44 @@ async def run_export(
     db: aiosqlite.Connection = Depends(get_db),
     _admin: dict = Depends(get_admin_user),
 ):
-    # Validate ratios
-    total_r = body.train_ratio + body.valid_ratio + (body.test_ratio if body.include_test else 0)
-    if abs(total_r - 1.0) > 0.01:
-        raise HTTPException(status_code=400, detail=f"Ratios must sum to 1.0 (got {total_r:.3f})")
+    if _export_lock.locked():
+        raise HTTPException(status_code=409, detail="Another export is running — try again when it finishes")
+    async with _export_lock:
+        return await _run_export(project_id, body, db)
 
-    proj = await _get_project_or_404(project_id, db)
-    classes: List[str] = json.loads(proj["classes"])
 
-    # Sanitise project name to be a safe directory name
-    safe_name = "".join(c if c.isalnum() or c in (" ", "_", "-") else "_" for c in proj["name"]).strip()
-    base_folder_name = f"{safe_name}_dataset"
-    project_dataset = DATASET_DIR / base_folder_name
+async def _run_export(project_id: str, body: ExportRequest, db: aiosqlite.Connection) -> ExportResult:
+    proj, split_plan, labels, seed = await prepare_export(project_id, body, db)
+    classes: List[str] = proj["classes"]
 
-    # Check for naming collisions and append (1), (2), etc.
-    if project_dataset.exists():
-        counter = 1
-        while True:
-            candidate_name = f"{base_folder_name} ({counter})"
-            candidate_dir = DATASET_DIR / candidate_name
-            if not candidate_dir.exists():
-                project_dataset = candidate_dir
-                break
-            counter += 1
+    dataset_dir = _next_dataset_dir(proj["name"])
+    loop = asyncio.get_running_loop()
+    last_pct = [-1]
 
-    # Get ready/exported images with deduplication safeguard
-    cur = await db.execute("""
-        SELECT i.id, i.filename, i.filepath, i.width, i.height
-        FROM images i
-        WHERE i.project_id=? AND i.state IN ('ready_for_export', 'exported')
-        ORDER BY i.filename
-    """, (project_id,))
-    raw_images = [dict(r) for r in await cur.fetchall()]
+    def progress(done: int, total: int):
+        pct = done * 100 // total if total else 100
+        if pct != last_pct[0] or done == total:
+            last_pct[0] = pct
+            asyncio.run_coroutine_threadsafe(emit_export_progress(done, total, project_id), loop)
 
-    seen_paths = set()
-    images = []
-    for img in raw_images:
-        norm_p = str(Path(img["filepath"]).resolve()) if img.get("filepath") else img["filename"]
-        if norm_p not in seen_paths:
-            seen_paths.add(norm_p)
-            images.append(img)
-
-    if not images:
-        raise HTTPException(status_code=400, detail="No images ready for export in this project")
-
-    # Split
-    train_imgs, valid_imgs, test_imgs = _split_list(
-        images, body.train_ratio, body.valid_ratio, body.test_ratio, body.include_test
+    writer = FolderWriter(dataset_dir)
+    exported_ids, counts, warnings = await asyncio.to_thread(
+        write_dataset, writer, split_plan, labels, classes, progress
     )
-
-    split_map = [
-        ("train", train_imgs),
-        ("valid", valid_imgs),
-        ("test",  test_imgs),
-    ]
-
-    # Ensure per-project dataset folder structure (clear and recreate each split)
-    for split_name, _ in split_map:
-        shutil.rmtree(project_dataset / split_name, ignore_errors=True)
-        for sub in ["images", "labels"]:
-            (project_dataset / split_name / sub).mkdir(parents=True, exist_ok=True)
-
-    orphan_warnings: List[str] = []
-    done = 0
-    total_count = len(images)
-    exported_ids: List[str] = []
-    counts = {"train": 0, "valid": 0, "test": 0}
-    used_dst_filenames = set()
-
-    for split_name, split_imgs in split_map:
-        for img in split_imgs:
-            image_id = img["id"]
-            fname    = img["filename"]
-            src_path = Path(img["filepath"])
-
-            # Resolve destination filename to prevent collision overwrites
-            target_fname = fname
-            if target_fname in used_dst_filenames:
-                stem_base = Path(fname).stem
-                ext_base = Path(fname).suffix
-                target_fname = f"{stem_base}_{image_id[:8]}{ext_base}"
-            used_dst_filenames.add(target_fname)
-
-            target_stem = Path(target_fname).stem
-            dst_img = project_dataset / split_name / "images" / target_fname
-
-            if src_path.exists():
-                shutil.copy2(src_path, dst_img)
-            else:
-                orphan_warnings.append(f"File not found on disk: {fname} ({src_path})")
-                done += 1
-                await emit_export_progress(done, total_count, project_id)
-                continue
-
-            # Fetch annotations
-            cur = await db.execute(
-                "SELECT * FROM annotations WHERE image_id=?", (image_id,)
-            )
-            ann_rows = await cur.fetchall()
-
-            # Write YOLO label file
-            dst_label = project_dataset / split_name / "labels" / f"{target_stem}.txt"
-            lines = []
-            img_w = max(1, img["width"])
-            img_h = max(1, img["height"])
-
-            for ann in ann_rows:
-                ann = dict(ann)
-                if ann["class_name"] not in classes:
-                    orphan_warnings.append(
-                        f"Skipped box in {fname}: class '{ann['class_name']}' not in project classes"
-                    )
-                    continue
-                cid = classes.index(ann["class_name"])
-                x_c = (ann["x"] + ann["w"] / 2) / img_w
-                y_c = (ann["y"] + ann["h"] / 2) / img_h
-                w_n = ann["w"] / img_w
-                h_n = ann["h"] / img_h
-                x_c = max(0.0, min(1.0, x_c))
-                y_c = max(0.0, min(1.0, y_c))
-                w_n = max(0.0, min(1.0, w_n))
-                h_n = max(0.0, min(1.0, h_n))
-                lines.append(f"{cid} {x_c:.6f} {y_c:.6f} {w_n:.6f} {h_n:.6f}")
-
-            with open(dst_label, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines))
-
-            exported_ids.append(image_id)
-            counts[split_name] += 1
-            done += 1
-            await emit_export_progress(done, total_count, project_id)
-
-    # Mark exported images in DB in safe batches of 500
-    if exported_ids:
-        batch_size = 500
-        for i in range(0, len(exported_ids), batch_size):
-            batch = exported_ids[i:i + batch_size]
-            placeholders = ",".join("?" * len(batch))
-            await db.execute(
-                f"UPDATE images SET state='exported' WHERE id IN ({placeholders})",
-                batch,
-            )
-        await db.commit()
-
-    # Generate per-project data.yaml
-    _write_data_yaml(classes, body.include_test, project_dataset)
-
-    # Broadcast final stats
-    stats = await _get_stats_dict(project_id, db)
-    await emit_stats(stats, project_id)
+    writer.add_text("data.yaml", build_data_yaml(classes, body.include_test, dataset_dir.as_posix()))
+    writer.add_text("manifest.json", json.dumps(
+        {**manifest(project_id, proj, body, seed, counts, len(exported_ids)),
+         "hard_linked_images": writer.linked}, indent=2))
+    await mark_exported(db, project_id, exported_ids, f"Exported {len(exported_ids)} images")
 
     return ExportResult(
         exported=len(exported_ids),
-        train=counts["train"],
-        valid=counts["valid"],
-        test=counts["test"],
-        orphan_warnings=orphan_warnings,
-        output_path=str(project_dataset),
+        train=counts.get("train", 0),
+        valid=counts.get("valid", 0),
+        test=counts.get("test", 0),
+        orphan_warnings=warnings,
+        output_path=str(dataset_dir),
+        seed=seed,
+        linked=writer.linked,
     )
 
-
-def _write_data_yaml(classes: List[str], include_test: bool, project_dataset: Path) -> None:
-    """Writes a YOLO-compatible data.yaml to the project's dataset root."""
-    lines = [
-        f"path: {project_dataset.as_posix()}",
-        "train: train/images",
-        "val: valid/images",
-    ]
-    if include_test:
-        lines.append("test: test/images")
-    lines.append("")
-    lines.append(f"nc: {len(classes)}")
-    names_str = "[" + ", ".join(f"'{c}'" for c in classes) + "]"
-    lines.append(f"names: {names_str}")
-
-    yaml_path = project_dataset / "data.yaml"
-    yaml_path.write_text("\n".join(lines), encoding="utf-8")

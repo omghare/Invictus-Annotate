@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% from "_brand.html" import icon %}
+{% block title %}System{% endblock %}
+{% block content %}
+<main class="page" style="max-width: 1080px">
+  <div class="page-head">
+    <div>
+      <div class="eyebrow">Workspace</div>
+      <h1>System &amp; storage</h1>
+      <p>What this machine runs on, and where the disk space goes.</p>
+    </div>
+    <div class="page-actions"><button class="btn" id="refresh">{{ icon('refresh-cw') }}Refresh</button></div>
+  </div>
+
+  <div class="grid-2">
+    <div class="panel">
+      <div class="panel-head"><h3>{{ icon('cpu') }}Compute</h3><span class="meta" id="mode"></span></div>
+      <div class="panel-body stack" id="compute"><span class="spinner"></span></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h3>{{ icon('sparkle') }}Model assist back-ends</h3></div>
+      <div class="panel-body stack">
+        <div id="providers"></div>
+        <p class="small muted">Inference and training pick the device on their own: CPU here, the GPU on a machine with an NVIDIA card and the CUDA build of PyTorch (see <code>INSTALL.md</code>). Heavier assistants (e.g. click-to-segment with SAM 2, text-prompt detection) plug in as extra back-ends on such a machine; their weights go to the model cache below, which can live on any drive.</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:16px">
+    <div class="panel-head"><h3>{{ icon('hard-drive') }}Storage</h3><span class="meta" id="drives"></span></div>
+    <div class="panel-body">
+      <div class="table-wrap"><table class="table"><thead><tr><th>What</th><th>Size</th><th>Folder</th></tr></thead><tbody id="folders"></tbody></table></div>
+      <p class="small muted" style="margin-top:10px" id="storage-note"></p>
+      <p class="small muted">To free space: delete old runs under <a class="link" href="/train#runs">Train model</a> and old cloud bundles in a project's Export section. Exports on the same drive as your images are hard links and cost almost nothing.</p>
+    </div>
+  </div>
+</main>
+{% endblock %}
+{% block scripts %}
+<script>
+(async () => {
+  const me = await IA.shell({ adminOnly: true, section: 'system' });
+  if (!me) return;
+  IA.setCrumbs([{ label: 'System' }]);
+  IA.connectSocket();
+  const $ = (id) => document.getElementById(id);
+  const row = (k, v) => `<div class="row between small"><span class="muted">${IA.esc(k)}</span><span>${v}</span></div>`;
+
+  async function load() {
+    let s;
+    try { s = await IA.get('/api/system'); }
+    catch (e) { $('compute').innerHTML = `<p class="small">${IA.esc(e.message)}</p>`; return; }
+    const c = s.compute;
+    $('mode').textContent = c.cuda_available ? 'GPU mode' : 'CPU mode';
+    $('compute').innerHTML = [
+      row('Processor', `${c.cpu_cores} cores / ${c.cpu_threads} threads`),
+      row('Memory', `${c.ram_gb} GB`),
+      row('GPU', c.cuda_available ? `${IA.esc(c.gpu_name || 'CUDA GPU')} · ${c.vram_gb} GB` : '<span class="muted">none usable (no CUDA)</span>'),
+      row('PyTorch', `${IA.esc(c.torch_version || 'not installed')}${c.torch_build ? ` <span class="chip ${c.torch_build === 'cuda' ? 'success' : ''}">${c.torch_build}</span>` : ''}`),
+      row('Ultralytics', IA.esc(c.ultralytics_version || 'not installed')),
+      row('Python', IA.esc(c.python)),
+      row('Training / inference device', c.default_device === 'cpu' ? 'CPU' : `GPU ${IA.esc(c.default_device)}`),
+    ].join('') + (c.cuda_available ? '' : `<div class="callout info" style="margin-top:8px">${IA.icon('info')}<div>Everything works on the CPU. Labelling and model assist are fine here; for long trainings use <b>cloud training</b> (Kaggle / Colab) from a project's Export section, or move to a machine with an NVIDIA GPU — no settings need to change.</div></div>`);
+    $('providers').innerHTML = s.providers.map((p) => `<div class="row between small"><span>${IA.esc(p.label)}</span>${p.status === 'ready' ? '<span class="chip success">ready</span>' : '<span class="chip warn">needs a GPU</span>'}</div>`).join('');
+    const short = (p) => { const parts = p.split(/[\\/]/).filter(Boolean); return parts.length > 3 ? `…\\${parts.slice(-2).join('\\')}` : p; };
+    $('folders').innerHTML = s.storage.folders.map((f) => `<tr><td class="strong">${IA.esc(f.label)}</td><td class="num">${IA.fmtBytes(f.bytes)}</td><td class="muted small"><code title="${IA.esc(f.path)}">${IA.esc(short(f.path))}</code></td></tr>`).join('');
+    $('drives').textContent = s.storage.drives.map((d) => `${d.drive} ${IA.fmtBytes(d.free)} free of ${IA.fmtBytes(d.total)}`).join(' · ');
+    $('storage-note').textContent = s.storage.note;
+  }
+  $('refresh').addEventListener('click', (e) => IA.busy(e.currentTarget, load));
+  load();
+})();
+</script>
+{% endblock %}

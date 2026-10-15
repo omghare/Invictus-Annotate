@@ -1,1249 +1,879 @@
 /**
- * dashboard.js — Admin dashboard logic (multi-project aware).
- * v2.0.0 — All API calls scoped to /api/projects/{project_id}/...
- * Project ID is extracted from the URL: /projects/{id}
+ * dashboard.js — admin project dashboard (/projects/{id}#section).
+ * Sections: overview, images, video, import, assign, review, assist, classes, export (+ cloud training).
+ * Long work (model assist, cloud bundles) runs as server jobs; progress arrives as `job_update`.
  */
-(() => {
+(async () => {
 'use strict';
 
-let user       = null;
-let project    = null;
-let projectId  = null;
-let allImages  = [];
-let users      = [];
-let classes    = [];
-let selectedImageIds = new Set();
-let unassignedCount = 0;
+const PID = window.PROJECT_ID;
+const user = await IA.shell({ adminOnly: true, projectId: PID });
+if (!user) return;
 
-// ── Init ──────────────────────────────────────────────────────────────
+let project = null;
+let stats = {};
+let users = [];
+let workloads = {};
+const names = new Map();          // image id → filename (for the activity feed)
+const $ = (id) => document.getElementById(id);
 
-async function init() {
-  user = IA.requireAuth(true);
-  if (!user) return;
-
-  // Extract project ID from URL: /projects/{id}
-  const parts = window.location.pathname.split('/');
-  projectId = parts[2] || null;
-
-  if (!projectId) {
-    IA.toast('No project selected — returning to Home', 'error');
-    setTimeout(() => { window.location.href = '/home'; }, 1500);
-    return;
-  }
-
-  await loadProject();
-  await loadStats();
-  await loadUsers();
-  initSocket();
-
-  const hashSection = window.location.hash.replace('#', '');
-  const validSections = ['overview', 'import', 'assign', 'review', 'all-images', 'users', 'classes', 'dataset'];
-  const startSection = validSections.includes(hashSection) ? hashSection : 'overview';
-  showSection(startSection);
-
-  window.addEventListener('hashchange', () => {
-    const s = window.location.hash.replace('#', '');
-    if (validSections.includes(s)) {
-      showSection(s);
-    }
-  });
+// ── Project + header ──────────────────────────────────────────────────────────
+try {
+  project = await IA.get(`/api/projects/${PID}`);
+} catch (e) {
+  IA.toast(e.status === 404 ? 'This project no longer exists' : e.message, 'error');
+  setTimeout(() => { location.href = '/home'; }, 1200);
+  return;
 }
 
-// ── Section routing ───────────────────────────────────────────────────
-
-window.showSection = (name) => {
-  document.querySelectorAll('.dash-section').forEach(s => s.classList.remove('active'));
-  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-  document.getElementById(`section-${name}`)?.classList.add('active');
-  document.getElementById(`nav-${name}`)?.classList.add('active');
-
-  // Lazy load section data
-  if (name === 'assign')  loadAssignSection();
-  if (name === 'import')  loadImportSection();
-  if (name === 'review')  loadReviewSection();
-  if (name === 'users')   renderUsersTable();
-  if (name === 'classes') renderClassesEditor();
-  if (name === 'dataset') { loadExportPreview(); buildYamlPreview(); loadExportedImages(); }
-  if (name === 'all-images') loadAllImagesSection();
-};
-
-// ── Project ───────────────────────────────────────────────────────────
-
-async function loadProject() {
-  const res = await IA.api(`/api/projects/${projectId}`);
-  if (res && res.ok) {
-    project = await res.json();
-    classes = project.classes;
-
-    // Update breadcrumbs in all sections
-    document.querySelectorAll('[id^="bc-project-name"]').forEach(el => {
-      el.textContent = project.name;
-    });
-
-    document.getElementById('project-name-side').textContent = project.name;
-    document.getElementById('source-folder-side').textContent = project.source_folder || 'No folder imported yet';
-    document.getElementById('project-label').textContent = project.name;
-    document.title = `${project.name} — Admin`;
-  } else {
-    // Project not found — go home
-    IA.toast('Project not found — returning to Home', 'error');
-    setTimeout(() => { window.location.href = '/home'; }, 1500);
-  }
+function renderHeader() {
+  document.title = `${project.name} · Invictus Annotate`;
+  $('project-name').textContent = project.name;
+  $('rail-project-name').textContent = project.name;
+  $('project-meta').textContent = [
+    IA.plural(project.classes.length, 'class', 'classes'),
+    project.source_folder ? `Last import: ${project.source_folder}` : 'No images imported yet',
+  ].join(' · ');
+  $('hero-thumb').innerHTML = project.thumbnail_image_id
+    ? `<img src="${IA.thumbUrl(project.thumbnail_image_id, 160)}" alt="" onerror="this.remove()"/>` : '';
 }
+renderHeader();
 
-// ── Stats ─────────────────────────────────────────────────────────────
-
+// ── Stats ─────────────────────────────────────────────────────────────────────
 async function loadStats() {
-  const res = await IA.api(`/api/projects/${projectId}/images/stats`);
-  if (!res || !res.ok) return;
-  const d = await res.json();
-  updateStats(d);
+  try { applyStats(await IA.get(`/api/projects/${PID}/stats`)); } catch { /* shown elsewhere */ }
 }
 
-function updateStats(d) {
-  const set = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
-  set('s-total',      d.total);
-  set('s-unassigned', d.unassigned);
-  unassignedCount = d.unassigned;
-  if (typeof updateDistributionPreview === 'function') updateDistributionPreview();
-  set('s-assigned',   d.assigned);
-  set('s-unannotated',d.unannotated);
-  set('s-annotated',  d.annotated);
-  set('s-ready',      d.ready_for_export);
-  set('s-exported',   d.exported);
-
-  // Sidebar badges
-  set('nav-unassigned-cnt', d.unassigned);
-  set('nav-ready-cnt',      d.ready_for_export);
-  set('ready-badge',        `${d.ready_for_export} ready`);
+function applyStats(s) {
+  stats = IA.derive(s);
+  const set = (k, v) => IA.countTo(document.querySelector(`#ov-stats [data-s="${k}"]`), v);
+  ['total', 'unassigned', 'pending', 'done', 'ready_for_export', 'exported'].forEach((k) => set(k, stats[k]));
+  document.querySelector('[data-s="pending-sub"]').textContent = stats.unannotated ? `${IA.fmtNum(stats.unannotated)} opened` : '';
+  document.querySelector('[data-s="done-sub"]').textContent = stats.annotated ? `${IA.fmtNum(stats.annotated)} not yet added to dataset` : 'all added to dataset';
+  $('ov-pct').textContent = `${stats.pct}%`;
+  $('ov-progress-meta').textContent = `${IA.fmtNum(stats.done)} of ${IA.fmtNum(stats.total)} annotated`;
+  if (!$('ov-bar').firstChild) $('ov-bar').innerHTML = IA.stateBar(stats, 'lg');
+  else IA.updateStateBar($('ov-bar').firstChild, stats);
+  $('ov-legend').innerHTML = Object.keys(IA.STATES).map((k) =>
+    `<span><i style="background:${IA.stateColor(k)}"></i>${IA.stateLabel(k)} ${IA.fmtNum(stats[k] || 0)}</span>`).join('');
+  IA.setNavCount('total', stats.total);
+  IA.setNavCount('unassigned', stats.unassigned, true);
+  IA.setNavCount('ready', stats.awaiting_review, true);
+  const rvCounts = { ...stats, inds: (stats.ready_for_export || 0) + (stats.exported || 0) };
+  $('rv-filter').querySelectorAll('button').forEach((b) => { b.querySelector('.count').textContent = IA.fmtNum(rvCounts[b.dataset.k] || 0); });
+  $('as-unassigned').textContent = `${IA.fmtNum(stats.unassigned)} unassigned`;
+  const sa = $('rv-submit-all');
+  sa.disabled = !stats.annotated;
+  sa.querySelector('span').textContent = stats.annotated
+    ? `Add All Annotated Images to Dataset (${IA.fmtNum(stats.annotated)})` : 'Add All Annotated Images to Dataset';
+  renderFilterCounts();
+  renderPlan();
 }
 
-// ── Live feed ─────────────────────────────────────────────────────────
-
-function addFeedItem(msg) {
-  const list = document.getElementById('feed-list');
-  if (!list) return;
-  const placeholder = list.querySelector('.text-muted');
-  if (placeholder) placeholder.remove();
-
-  const item = document.createElement('div');
-  item.className = 'feed-item';
-  const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  item.innerHTML = `<div class="feed-dot"></div><div class="feed-time">${time}</div><div class="feed-msg">${msg}</div>`;
-  list.insertBefore(item, list.firstChild);
-
-  while (list.children.length > 50) list.lastChild.remove();
-}
-
-// ── Import ────────────────────────────────────────────────────────────
-
-async function loadImportSection() {
-  const res = await IA.api(`/api/projects/${projectId}/images?per_page=200`);
-  if (!res || !res.ok) return;
-  const data = await res.json();
-  allImages = data.items;
-  renderImportGrid(allImages);
-  document.getElementById('imported-count').textContent = `${data.total} images`;
-}
-
-function renderImportGrid(imgs) {
-  const grid = document.getElementById('import-image-grid');
-  if (!grid) return;
-  if (imgs.length === 0) {
-    grid.innerHTML = '<div class="text-muted text-sm" style="padding:20px;grid-column:1/-1">No images yet. Import a folder above.</div>';
-    return;
-  }
-  grid.innerHTML = imgs.map(img => `
-    <div class="img-thumb" title="${img.filename}" style="cursor:default">
-      <img src="${IA.imgUrl(img.id)}" alt="${img.filename}" loading="lazy" onerror="this.style.display='none'"/>
-      <div class="img-state-dot" style="background:${IA.stateColor(img.state)}"></div>
-    </div>
-  `).join('');
-}
-
-window.importImages = async () => {
-  if (!project) { IA.toast('Project not loaded', 'error'); return; }
-  const pathInput = document.getElementById('import-folder-path');
-  const folder_path = pathInput ? pathInput.value.trim() : '';
-  const btn = document.getElementById('import-btn');
-  btn.disabled = true;
-
-  btn.textContent = folder_path ? '⏳ Importing images…' : '⏳ Opening folder dialog…';
-
+// ── People ────────────────────────────────────────────────────────────────────
+async function loadPeople() {
   try {
-    const res = await IA.api(`/api/projects/${projectId}/import`, {
-      method: 'POST',
-      body: JSON.stringify({ folder_path })
-    });
-    if (res && res.ok) {
-      const data = await res.json();
-      const resultEl = document.getElementById('import-result');
-      resultEl.classList.remove('hidden');
-      resultEl.innerHTML = `<div style="background:var(--green-d);border:1px solid rgba(34,211,160,0.3);border-radius:var(--radius);padding:12px 16px;font-size:13px;color:var(--green)">
-        ✓ Imported <strong>${data.imported}</strong> images from <code>${data.folder}</code>.
-        ${data.skipped > 0 ? `<br>${data.skipped} skipped (already imported).` : ''}
-      </div>`;
-      if (pathInput) pathInput.value = '';
-      await loadStats();
-      await loadImportSection();
-    } else {
-      const err = await res?.json();
-      IA.toast(IA.formatError(err), 'error');
-    }
-  } catch(e) {
-    IA.toast('Network error', 'error');
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '📁 Import Images';
-  }
-};
+    [users, workloads] = await Promise.all([IA.get('/api/users'), IA.get(`/api/projects/${PID}/user-workloads`)]);
+  } catch (e) { IA.toast(e.message, 'error'); return; }
+  const rows = users.map((u) => ({ u, w: workloads[u.id] })).filter((r) => r.w && r.w.total > 0)
+    .sort((a, b) => b.w.total - a.w.total);
+  $('ov-people').innerHTML = rows.length ? rows.map(({ u, w }) => {
+    const done = w.annotated + w.ready + w.exported;
+    const bar = IA.stateBar({ assigned: w.assigned, annotated: w.annotated, ready_for_export: w.ready, exported: w.exported });
+    const reviewed = w.approved + w.rejected;
+    const rv = reviewed ? `<div class="small muted" title="Frames reviewed: approved / sent back">${IA.fmtNum(w.approved)} approved · ${IA.fmtNum(w.rejected)} sent back (${Math.round((w.rejected / reviewed) * 100)}%)</div>` : '';
+    return `<div class="person">${IA.avatar(u.username)}<div style="min-width:0"><div class="nm">${IA.esc(u.username)}</div>${bar}${rv}</div>
+      <div class="n">${IA.fmtNum(done)} / ${IA.fmtNum(w.total)}</div></div>`;
+  }).join('') : `<p class="small muted">Nobody has images yet. <a class="link" href="#assign">Assign some</a>.</p>`;
+  const sel = $('img-assignee');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">Anyone</option>' + users.map((u) => `<option value="${u.id}">${IA.esc(u.username)}</option>`).join('');
+  sel.value = cur;
+  renderAssignUsers();
+}
 
-// ── Video Import ────────────────────────────────────────────────────────
-
-window.openVideoImportModal = () => {
-  const body = `
-    <div style="display:flex; flex-direction:column; gap:16px;">
-      <p style="color:var(--text-secondary);font-size:13px;margin:0">
-        Select a video file to losslessly extract frames from. The frames will be extracted as PNGs to preserve maximum quality, then automatically imported into your dataset in chronological order.
-      </p>
-      <div style="display:flex;gap:10px;align-items:center">
-        <input class="form-input" id="vi-path" placeholder="Click 'Select Video'..." readonly style="flex:1"/>
-        <button class="btn btn-secondary" onclick="pickVideoFile()" style="flex-shrink:0">📁 Select Video</button>
-      </div>
-      <div>
-        <label class="form-label" style="display:inline-block; margin-right:10px;">Extraction FPS:</label>
-        <input type="number" id="vi-fps" class="form-input" value="5" min="0.1" step="0.1" style="width:80px; display:inline-block;"/>
-      </div>
-      <div id="vi-status" class="hidden" style="font-size:13px; padding:10px; border-radius:4px;"></div>
-    </div>
-  `;
-
-  IA.openModal('Import Video to Dataset', body, [
-    { label: 'Cancel', cls: 'btn-ghost', fn: IA.closeModal },
-    { label: 'Extract & Import', cls: 'btn-primary', fn: processAndImportVideo }
-  ]);
-};
-
-window.pickVideoFile = async () => {
-  const pathInput = document.getElementById('vi-path');
-  const btn = document.querySelector('button[onclick="pickVideoFile()"]');
-  const oldText = btn.textContent;
-  btn.textContent = '⏳ ...';
-  btn.disabled = true;
-
+// ── Missing files warning (e.g. the image folder was moved or deleted) ────────
+async function checkFiles() {
+  const box = $('ov-files');
   try {
-    const res = await IA.api('/api/video/pick_import');
-    if (res && res.ok) {
-      const data = await res.json();
-      pathInput.value = data.filepath;
-    } else {
-      const err = await res?.json();
-      IA.toast(IA.formatError(err) || 'No file selected', 'error');
-    }
-  } catch (e) {
-    IA.toast('Error opening file dialog', 'error');
-  } finally {
-    btn.textContent = oldText;
-    btn.disabled = false;
-  }
-};
-
-window.processAndImportVideo = async () => {
-  const filepath = document.getElementById('vi-path').value.trim();
-  const fps = parseFloat(document.getElementById('vi-fps').value);
-  const statusEl = document.getElementById('vi-status');
-
-  if (!filepath) {
-    IA.toast('Please select a video file first', 'error');
-    return;
-  }
-  if (isNaN(fps) || fps <= 0) {
-    IA.toast('Please enter a valid FPS greater than 0', 'error');
-    return;
-  }
-
-  // Disable actions
-  const actions = document.getElementById('modal-actions').querySelectorAll('button');
-  actions.forEach(b => b.disabled = true);
-
-  statusEl.classList.remove('hidden');
-  statusEl.style.background = 'var(--blue-d)';
-  statusEl.style.color = 'var(--blue)';
-  statusEl.style.border = '1px solid rgba(0, 122, 204, 0.3)';
-  statusEl.innerHTML = '⏳ Extracting frames losslessly... This may take a while depending on video length and FPS.';
-
-  try {
-    // 1. Extract Frames
-    const extractRes = await IA.api('/api/video/extract_frames', {
-      method: 'POST',
-      body: JSON.stringify({ filepath, fps, project_id: projectId })
-    });
-    
-    if (!extractRes || !extractRes.ok) {
-      const err = await extractRes?.json();
-      throw new Error(IA.formatError(err) || 'Extraction failed');
-    }
-    const extractData = await extractRes.json();
-    const folder_path = extractData.folder_path;
-
-    statusEl.innerHTML = '⏳ Extraction complete! Importing frames into dataset...';
-
-    // 2. Import Images from the new folder
-    const importRes = await IA.api(`/api/projects/${projectId}/import`, {
-      method: 'POST',
-      body: JSON.stringify({ folder_path })
-    });
-
-    if (importRes && importRes.ok) {
-      const importData = await importRes.json();
-      statusEl.style.background = 'var(--green-d)';
-      statusEl.style.color = 'var(--green)';
-      statusEl.style.border = '1px solid rgba(34, 211, 160, 0.3)';
-      statusEl.innerHTML = `✓ Success! Imported <strong>${importData.imported}</strong> frames into the dataset.`;
-      
-      // Update UI
-      await loadStats();
-      await loadImportSection();
-      
-      // Close modal after 2 seconds
-      setTimeout(() => IA.closeModal(), 2000);
-    } else {
-      const err = await importRes?.json();
-      throw new Error(IA.formatError(err) || 'Import failed');
-    }
-  } catch (e) {
-    statusEl.style.background = 'var(--red-d)';
-    statusEl.style.color = 'var(--red)';
-    statusEl.style.border = '1px solid rgba(239, 68, 68, 0.3)';
-    statusEl.innerHTML = `❌ Error: ${e.message}`;
-  } finally {
-    // Re-enable close button only
-    actions[0].disabled = false;
-  }
-};
-
-// ── Assign ────────────────────────────────────────────────────────────
-
-async function loadAssignSection() {
-  const res = await IA.api(`/api/projects/${projectId}/images?state=unassigned&per_page=200`);
-  if (!res || !res.ok) return;
-  const data = await res.json();
-
-  // Fetch workloads
-  const wlRes = await IA.api(`/api/projects/${projectId}/user-workloads`);
-  const workloads = (wlRes && wlRes.ok) ? await wlRes.json() : {};
-
-  renderAssignGrid(data.items);
-  populateUserSelect();
-  renderAssignUsers(workloads);
-  updateDistributionPreview();
+    const r = await IA.get(`/api/projects/${PID}/files/check`);
+    box.classList.toggle('hidden', !r.missing);
+    if (!r.missing) return;
+    box.innerHTML = `<div class="callout warn">${IA.icon('image-off')}<div style="flex:1">
+      <b>${IA.fmtNum(r.missing)} of ${IA.fmtNum(r.total)} image files can’t be found on the server.</b>
+      Annotators will see an empty frame for these. Last known location: <code>${IA.esc(r.missing_folders[0] || '')}</code>${r.missing_folders.length > 1 ? ` and ${r.missing_folders.length - 1} more` : ''}.
+      <div class="row" style="margin-top:8px"><a class="btn btn-sm" href="#import">${IA.icon('refresh-cw')}Relink to the new location</a></div></div></div>`;
+  } catch { box.classList.add('hidden'); }
 }
 
-function renderAssignGrid(imgs) {
-  const grid = document.getElementById('assign-image-grid');
-  selectedImageIds.clear();
-  updateSelectedCount();
-
-  if (imgs.length === 0) {
-    grid.innerHTML = '<div class="text-muted text-sm" style="padding:20px;grid-column:1/-1;text-align:center">No unassigned images.</div>';
-    return;
-  }
-  grid.innerHTML = imgs.map(img => `
-    <div class="img-thumb" data-id="${img.id}" onclick="toggleSelect('${img.id}', this)">
-      <input type="checkbox" class="img-check" onclick="event.stopPropagation()"/>
-      <img src="${IA.imgUrl(img.id)}" alt="${img.filename}" loading="lazy" onerror="this.style.display='none'"/>
-    </div>
-  `).join('');
+// ── Activity feed ─────────────────────────────────────────────────────────────
+function feed(actor, html) {
+  const list = $('feed');
+  list.querySelector('.empty')?.remove();
+  const item = IA.h(`<div class="feed-item">${actor ? IA.avatar(actor, 'sm') : `<span class="avatar sm">${IA.icon('activity', 'i-sm')}</span>`}
+    <div>${html}</div><time>${IA.esc(IA.fmtTime(new Date().toISOString()))}</time></div>`);
+  list.prepend(item);
+  while (list.children.length > 40) list.lastElementChild.remove();
 }
+const fileLabel = (id) => (names.has(id) ? `<code>${IA.esc(names.get(id))}</code>` : 'an image');
 
-window.toggleSelect = (id, el) => {
-  if (selectedImageIds.has(id)) {
-    selectedImageIds.delete(id);
-    el.classList.remove('selected');
-    el.querySelector('.img-check').checked = false;
-  } else {
-    selectedImageIds.add(id);
-    el.classList.add('selected');
-    el.querySelector('.img-check').checked = true;
-  }
-  updateSelectedCount();
-};
-window.selectAll  = () => { document.querySelectorAll('#assign-image-grid .img-thumb').forEach(el => { const id = el.dataset.id; selectedImageIds.add(id); el.classList.add('selected'); el.querySelector('.img-check').checked = true; }); updateSelectedCount(); };
-window.selectNone = () => { document.querySelectorAll('#assign-image-grid .img-thumb').forEach(el => { selectedImageIds.delete(el.dataset.id); el.classList.remove('selected'); el.querySelector('.img-check').checked = false; }); selectedImageIds.clear(); updateSelectedCount(); };
-
-function updateSelectedCount() {
-  const el = document.getElementById('selected-count');
-  if (el) el.textContent = `${selectedImageIds.size} selected`;
-  updateDistributionPreview();
-}
-
-function populateUserSelect() {
-  const sel = document.getElementById('assign-user-select');
-  if (!sel) return;
-  const currentUserId = user ? user.id : null;
-  sel.innerHTML = '<option value="">Select user…</option>' +
-    users.map(u => {
-      // Auto-select if single user or matching current user
-      const isSelected = (users.length === 1 || u.id === currentUserId);
-      return `<option value="${u.id}" ${isSelected ? 'selected' : ''}>${u.username}${u.is_admin ? ' (Admin)' : ''}</option>`;
-    }).join('');
-}
-
-window.assignSelected = async () => {
-  let uid = document.getElementById('assign-user-select').value;
-  // If no user selected, fallback to current logged in admin user
-  if (!uid && user && user.id) uid = user.id;
-
-  if (!uid)                     { IA.toast('Select a user first', 'error'); return; }
-  if (selectedImageIds.size===0){ IA.toast('Select images first', 'error'); return; }
-
-  const res = await IA.api(`/api/projects/${projectId}/images/assign`, {
-    method: 'POST',
-    body: JSON.stringify({ image_ids: [...selectedImageIds], user_id: uid }),
-  });
-  if (res && res.ok) {
-    IA.toast(`${selectedImageIds.size} images assigned ✓`, 'success');
-    await loadAssignSection();
-    await loadStats();
-  } else {
-    const e = await res?.json();
-    IA.toast(IA.formatError(e), 'error');
-  }
-};
-
-window.assignToMe = async () => {
-  if (!user || !user.id) { IA.toast('User context missing', 'error'); return; }
-  const uid = user.id;
-
-  // Use selected images if any, otherwise assign all unassigned images
-  let targetImageIds = [...selectedImageIds];
-  if (targetImageIds.length === 0) {
-    const resUnassigned = await IA.api(`/api/projects/${projectId}/images?state=unassigned&per_page=200`);
-    if (resUnassigned && resUnassigned.ok) {
-      const data = await resUnassigned.json();
-      targetImageIds = (data.items || []).map(img => img.id);
-    }
-  }
-
-  if (targetImageIds.length === 0) {
-    IA.toast('No unassigned images to assign', 'error');
-    return;
-  }
-
-  const res = await IA.api(`/api/projects/${projectId}/images/assign`, {
-    method: 'POST',
-    body: JSON.stringify({ image_ids: targetImageIds, user_id: uid }),
-  });
-  if (res && res.ok) {
-    IA.toast(`${targetImageIds.length} images assigned to ${user.username} ✓`, 'success');
-    selectedImageIds.clear();
-    await loadAssignSection();
-    await loadStats();
-  } else {
-    const e = await res?.json();
-    IA.toast(IA.formatError(e), 'error');
-  }
-};
-
-function renderAssignUsers(workloads) {
-  const container = document.getElementById('assign-users-list');
-  if (!container) return;
-
-  if (users.length === 0) {
-    container.innerHTML = '<div class="text-muted text-sm" style="padding:10px;text-align:center">No users available.</div>';
-    return;
-  }
-
-  container.innerHTML = users.map(u => {
-    const wl = workloads[u.id] || { assigned: 0, annotated: 0, ready: 0, total: 0 };
-    const initials = u.username.slice(0, 2).toUpperCase();
-    
-    // Check all users by default so single admin or selected users are ready for distribution
-    const checkedAttr = 'checked';
-    
-    return `
-      <label class="assign-user-item" style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;background:var(--bg-elevated);border:1px solid var(--border);border-radius:var(--radius-sm);cursor:pointer;user-select:none;transition:border-color var(--t-fast);">
-        <div style="display:flex;align-items:center;gap:8px">
-          <input type="checkbox" class="user-check" data-id="${u.id}" onchange="updateDistributionPreview()" ${checkedAttr} style="accent-color:var(--accent)"/>
-          <span class="user-avatar" style="width:24px;height:24px;font-size:10px;display:inline-flex;align-items:center;justify-content:center;background:var(--accent-dim);color:var(--accent-light);border-radius:50%;font-weight:700;">${initials}</span>
-          <span style="font-weight:500;">${u.username}</span>
-          ${u.is_admin ? '<span class="badge badge-ready" style="font-size:9px;padding:1px 4px;">Admin</span>' : '<span class="badge badge-assigned" style="font-size:9px;padding:1px 4px;">Annotator</span>'}
-        </div>
-        <div style="font-size:11px;color:var(--text-secondary)">
-          <span>${wl.total}</span> assigned
-        </div>
-      </label>
-    `;
-  }).join('');
-}
-
-window.updateDistributionPreview = () => {
-  const distUnassigned = document.getElementById('dist-unassigned-cnt');
-  const distSelected = document.getElementById('dist-selected-cnt');
-  const distUsers = document.getElementById('dist-users-cnt');
-  const distPreviewMsg = document.getElementById('dist-preview-msg');
-  const btnAutoDistribute = document.getElementById('btn-auto-distribute');
-  
-  if (!distUnassigned || !distSelected || !distUsers || !distPreviewMsg || !btnAutoDistribute) return;
-  
-  distUnassigned.textContent = unassignedCount;
-  distSelected.textContent = selectedImageIds.size;
-  
-  const checkedUsers = [];
-  document.querySelectorAll('#assign-users-list .user-check:checked').forEach(el => {
-    checkedUsers.push(el.dataset.id);
-  });
-  distUsers.textContent = checkedUsers.length;
-  
-  const targetCount = selectedImageIds.size > 0 ? selectedImageIds.size : unassignedCount;
-  const isSelectedImages = selectedImageIds.size > 0;
-  
-  if (checkedUsers.length === 0) {
-    distPreviewMsg.innerHTML = '<span style="color:var(--red)">Select at least 1 user (or click "Assign to Me").</span>';
-    btnAutoDistribute.disabled = true;
-    return;
-  }
-  
-  if (targetCount === 0) {
-    distPreviewMsg.innerHTML = '<span style="color:var(--text-secondary)">No unassigned images to distribute.</span>';
-    btnAutoDistribute.disabled = true;
-    return;
-  }
-  
-  btnAutoDistribute.disabled = false;
-  
-  const base = Math.floor(targetCount / checkedUsers.length);
-  const remainder = targetCount % checkedUsers.length;
-  
-  let msg = '';
-  if (isSelectedImages) {
-    msg += `Distributing <strong>${targetCount} selected</strong> images:<br/>`;
-  } else {
-    msg += `Distributing <strong>all ${targetCount} unassigned</strong> images:<br/>`;
-  }
-  
-  if (base > 0) {
-    msg += `Each user gets <strong>${base}</strong> image${base > 1 ? 's' : ''}`;
-    if (remainder > 0) {
-      msg += `, and <strong>${remainder}</strong> left over (distributed randomly)`;
-    }
-  } else {
-    msg += `Only <strong>${remainder}</strong> image${remainder > 1 ? 's' : ''} to distribute. Some users will get 1, others 0.`;
-  }
-  
-  distPreviewMsg.innerHTML = msg;
-};
-
-window.selectAllUsers = () => {
-  document.querySelectorAll('#assign-users-list .user-check').forEach(el => {
-    el.checked = true;
-  });
-  updateDistributionPreview();
-};
-
-window.selectNoUsers = () => {
-  document.querySelectorAll('#assign-users-list .user-check').forEach(el => {
-    el.checked = false;
-  });
-  updateDistributionPreview();
-};
-
-window.autoDistribute = async () => {
-  const checkedUsers = [];
-  document.querySelectorAll('#assign-users-list .user-check:checked').forEach(el => {
-    checkedUsers.push(el.dataset.id);
-  });
-  
-  if (checkedUsers.length === 0) {
-    IA.toast('Select at least one user', 'error');
-    return;
-  }
-  
-  const targetCount = selectedImageIds.size > 0 ? selectedImageIds.size : unassignedCount;
-  if (targetCount === 0) {
-    IA.toast('No unassigned images to distribute', 'error');
-    return;
-  }
-  
-  const payload = {
-    user_ids: checkedUsers
+// ── Generic paginated, selectable thumbnail grid ──────────────────────────────
+function makeGrid({ el, pager, params, empty, onChange }) {
+  const g = { page: 1, perPage: 50, items: [], total: 0, pages: 1, selected: new Set(), anchor: null, seq: 0 };
+  g.load = async (resetPage = false) => {
+    if (resetPage) g.page = 1;
+    const seq = ++g.seq;
+    if (!g.items.length) el.innerHTML = Array.from({ length: 8 }, () => '<div class="thumb"><div class="media skel"></div><div class="meta"><div class="skel" style="height:10px;width:70%"></div></div></div>').join('');
+    const q = new URLSearchParams({ page: g.page, per_page: g.perPage, ...params() });
+    let data;
+    try { data = await IA.get(`/api/projects/${PID}/images?${q}`); }
+    catch (e) { el.innerHTML = `<div class="empty"><h3>Couldn't load images</h3><p>${IA.esc(e.message)}</p></div>`; return; }
+    if (seq !== g.seq) return;                       // a newer request superseded this one
+    Object.assign(g, { items: data.items, total: data.total, pages: data.total_pages, page: data.page });
+    data.items.forEach((i) => names.set(i.id, i.filename));
+    g.render();
+    onChange?.(g);
   };
-  
-  if (selectedImageIds.size > 0) {
-    payload.image_ids = [...selectedImageIds];
-  }
-  
-  const btn = document.getElementById('btn-auto-distribute');
-  const oldText = btn.textContent;
-  btn.disabled = true;
-  btn.textContent = 'Distributing…';
-  
-  try {
-    const res = await IA.api(`/api/projects/${projectId}/images/auto-assign`, {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    });
-    
-    if (res && res.ok) {
-      const d = await res.json();
-      IA.toast(d.detail, 'success');
-      selectedImageIds.clear();
-      await loadAssignSection();
-      await loadStats();
-    } else {
-      const e = await res?.json();
-      IA.toast(IA.formatError(e), 'error');
-    }
-  } catch (err) {
-    IA.toast('Connection error', 'error');
-  } finally {
-    btn.disabled = false;
-    btn.textContent = oldText;
-  }
-};
-
-// ── Review ────────────────────────────────────────────────────────────
-
-async function loadReviewSection() {
-  const res = await IA.api(`/api/projects/${projectId}/images?state=ready_for_export&per_page=200`);
-  if (!res || !res.ok) return;
-  const data = await res.json();
-  renderReviewGrid(data.items);
-}
-
-function renderReviewGrid(imgs) {
-  const grid = document.getElementById('review-grid');
-  if (!grid) return;
-  const expBtn = document.getElementById('review-export-btn');
-  if (imgs.length === 0) {
-    grid.innerHTML = '<div class="empty-state" style="grid-column:1/-1"><div class="empty-icon">✅</div><h3>Queue is empty</h3><p style="font-size:12px;margin-top:4px">No images submitted for review yet.</p></div>';
-    if (expBtn) expBtn.classList.add('hidden');
-    return;
-  }
-  if (expBtn) expBtn.classList.remove('hidden');
-  grid.innerHTML = imgs.map(img => `
-    <div class="review-card" id="rcard-${img.id}">
-      <a href="/projects/${projectId}/annotate/${img.id}" target="_blank">
-        <img class="review-img" src="${IA.imgUrl(img.id)}" alt="${img.filename}" loading="lazy" onerror="this.style.display='none'"/>
-      </a>
-      <div class="review-footer">
-        <span class="review-name" title="${img.filename}">${img.filename}</span>
-        <button class="btn btn-danger btn-sm" onclick="deleteImage('${img.id}')">🗑</button>
-      </div>
-    </div>
-  `).join('');
-}
-
-window.deleteImage = async (id) => {
-  if (!confirm('Delete this image from the project? The source file will NOT be deleted.')) return;
-  const res = await IA.api(`/api/projects/${projectId}/images/${id}`, { method: 'DELETE' });
-  if (res && res.ok) {
-    document.getElementById(`rcard-${id}`)?.remove();
-    IA.toast('Image deleted', 'success');
-    await loadStats();
-  } else {
-    const e = await res?.json();
-    IA.toast(IA.formatError(e), 'error');
-  }
-};
-
-// ── Users ─────────────────────────────────────────────────────────────
-
-async function loadUsers() {
-  const res = await IA.api('/api/users');
-  if (!res || !res.ok) return;
-  users = await res.json();
-}
-
-async function renderUsersTable() {
-  await loadUsers();
-  const tbody = document.getElementById('users-table-body');
-  if (!tbody) return;
-
-  if (users.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:24px;color:var(--text-muted)">No users</td></tr>';
-    return;
-  }
-
-  // Get workloads via optimized endpoint
-  const res = await IA.api(`/api/projects/${projectId}/user-workloads`);
-  const workloads = (res && res.ok) ? await res.json() : {};
-
-  tbody.innerHTML = users.map(u => {
-    const wl = workloads[u.id] || { assigned: 0, annotated: 0, ready: 0, total: 0 };
-    const initials  = u.username.slice(0, 2).toUpperCase();
-    return `<tr>
-      <td><div style="display:flex;align-items:center;gap:8px">
-        <span class="user-avatar">${initials}</span> ${u.username}
-      </div></td>
-      <td>${u.is_admin ? '<span class="badge badge-ready">Admin</span>' : '<span class="badge badge-assigned">Annotator</span>'}</td>
-      <td>${wl.total}</td>
-      <td>${wl.annotated}</td>
-      <td>${wl.ready}</td>
-      <td>
-        <div style="display:flex;gap:6px;align-items:center">
-          <button class="btn btn-ghost btn-sm" onclick="resetPassword('${u.id}','${u.username}')">🔑 Reset PW</button>
-          <button class="btn btn-danger btn-sm" onclick="confirmRemoveFromProject('${u.id}','${u.username}', ${wl.total}, ${wl.assigned}, ${wl.total - wl.assigned})">👤 Remove from Project</button>
-          ${!u.is_admin ? `<button class="btn btn-danger btn-sm" onclick="deleteUser('${u.id}','${u.username}')">🗑 Delete User</button>` : ''}
-        </div>
-      </td>
-    </tr>`;
-  }).join('');
-}
-
-window.confirmRemoveFromProject = (userId, username, total, unannotated, annotated) => {
-  const bodyHtml = `
-    <div style="font-size:14px;color:var(--text-primary);display:flex;flex-direction:column;gap:12px;">
-      <p>How do you want to remove <strong>${username}</strong> from this project?</p>
-      <p style="color:var(--text-secondary);font-size:13px;">
-        Currently has <strong>${total}</strong> images assigned (<strong>${annotated}</strong> annotated, <strong>${unannotated}</strong> unannotated).
-      </p>
-      
-      <div style="display:flex;flex-direction:column;gap:10px;margin-top:10px">
-        <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;background:var(--bg-elevated);padding:12px;border:1px solid var(--border);border-radius:var(--radius);transition:border-color var(--t-fast);">
-          <input type="radio" name="remove-option" id="remove-opt-delete" checked style="margin-top:4px;accent-color:var(--accent);"/>
-          <div>
-            <strong style="color:var(--red);">Option 1: Remove user & delete annotated images</strong>
-            <div style="font-size:12px;color:var(--text-secondary);margin-top:4px;">
-              Deletes their annotated/submitted/exported images from the project entirely. Any unannotated images assigned to them will return to the unassigned pool.
-            </div>
-          </div>
-        </label>
-        
-        <label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;background:var(--bg-elevated);padding:12px;border:1px solid var(--border);border-radius:var(--radius);transition:border-color var(--t-fast);">
-          <input type="radio" name="remove-option" id="remove-opt-keep" style="margin-top:4px;accent-color:var(--accent);"/>
-          <div>
-            <strong style="color:var(--green);">Option 2: Remove user & keep annotated images</strong>
-            <div style="font-size:12px;color:var(--text-secondary);margin-top:4px;">
-              Preserves their annotated/submitted/exported images in the project (assignment cleared). Any unannotated images assigned to them will return to the unassigned pool.
-            </div>
-          </div>
-        </label>
-      </div>
-    </div>
-  `;
-
-  IA.openModal('Remove User from Project', bodyHtml, [
-    {
-      label: 'Cancel',
-      cls: 'btn-ghost',
-      fn: IA.closeModal
-    },
-    {
-      label: 'Remove User',
-      cls: 'btn-danger',
-      fn: () => submitRemoveUserFromProject(userId, username)
-    }
-  ]);
-};
-
-window.submitRemoveUserFromProject = async (userId, username) => {
-  const keepAnnotated = document.getElementById('remove-opt-keep').checked;
-  const modalActions = document.getElementById('modal-actions');
-  const removeBtn = modalActions ? modalActions.querySelector('.btn-danger') : null;
-  if (removeBtn) {
-    removeBtn.disabled = true;
-    removeBtn.textContent = 'Removing…';
-  }
-
-  try {
-    const res = await IA.api(`/api/projects/${projectId}/users/${userId}/remove`, {
-      method: 'POST',
-      body: JSON.stringify({ keep_annotated: keepAnnotated })
-    });
-    
-    if (res && res.ok) {
-      const d = await res.json();
-      IA.toast(d.detail, 'success');
-      IA.closeModal();
-      await renderUsersTable();
-      await loadStats();
-      // If we are currently in assign section, refresh it as well
-      const assignSec = document.getElementById('section-assign');
-      if (assignSec && assignSec.classList.contains('active')) {
-        await loadAssignSection();
-      }
-    } else {
-      const e = await res?.json();
-      IA.toast(IA.formatError(e), 'error');
-      if (removeBtn) {
-        removeBtn.disabled = false;
-        removeBtn.textContent = 'Remove User';
-      }
-    }
-  } catch (err) {
-    IA.toast('Connection error', 'error');
-    if (removeBtn) {
-      removeBtn.disabled = false;
-      removeBtn.textContent = 'Remove User';
-    }
-  }
-};
-
-window.showCreateUser = () => {
-  document.getElementById('create-user-form').classList.toggle('hidden');
-};
-
-window.createUser = async () => {
-  const username = document.getElementById('new-username').value.trim();
-  const password = document.getElementById('new-password').value;
-  const is_admin = document.getElementById('new-is-admin').value === 'true';
-
-  if (!username || !password) { IA.toast('Fill in all fields', 'error'); return; }
-
-  const res = await IA.api('/api/users', {
-    method: 'POST',
-    body: JSON.stringify({ username, password, is_admin }),
-  });
-  if (res && res.ok) {
-    IA.toast(`User "${username}" created ✓`, 'success');
-    document.getElementById('new-username').value = '';
-    document.getElementById('new-password').value = '';
-    document.getElementById('create-user-form').classList.add('hidden');
-    await renderUsersTable();
-    populateUserSelect();
-  } else {
-    const e = await res?.json();
-    IA.toast(IA.formatError(e), 'error');
-  }
-};
-
-window.deleteUser = async (id, username) => {
-  if (!confirm(`Delete user "${username}"? Their images will be unassigned.`)) return;
-  const res = await IA.api(`/api/users/${id}`, { method: 'DELETE' });
-  if (res && res.ok) {
-    IA.toast(`User "${username}" deleted`, 'success');
-    await renderUsersTable();
-    await loadStats();
-  } else {
-    const e = await res?.json();
-    IA.toast(IA.formatError(e), 'error');
-  }
-};
-
-window.resetPassword = async (id, username) => {
-  const pw = prompt(`New password for "${username}" (min 4 chars):`);
-  if (!pw || pw.length < 4) { IA.toast('Password too short', 'error'); return; }
-  const res = await IA.api(`/api/users/${id}/password`, {
-    method: 'PATCH',
-    body: JSON.stringify({ password: pw }),
-  });
-  if (res && res.ok) IA.toast('Password updated ✓', 'success');
-  else IA.toast('Failed', 'error');
-};
-
-// ── Classes editor ────────────────────────────────────────────────────
-
-function renderClassesEditor() {
-  if (!project) return;
-  const wrap = document.getElementById('classes-wrap');
-  if (!wrap) return;
-  classes = [...(project.classes || [])];
-  redrawClassTags();
-}
-
-function redrawClassTags() {
-  const wrap = document.getElementById('classes-wrap');
-  if (!wrap) return;
-  wrap.innerHTML = classes.map((cls, i) => {
-    const hue = (i * 137.508) % 360;
-    const color = `hsl(${hue.toFixed(0)}, 85%, 62%)`;
-    return `<div class="class-tag">
-      <span class="class-dot" style="background:${color}"></span>
-      ${cls}
-      <span class="class-del" onclick="removeClass(${i})">×</span>
-    </div>`;
-  }).join('');
-}
-
-window.addClass = window.addClassTag = () => {
-  const input = document.getElementById('new-class-input');
-  const val   = input.value.trim();
-  if (!val) return;
-  if (classes.includes(val)) { IA.toast('Class already exists', 'error'); return; }
-  classes.push(val);
-  input.value = '';
-  redrawClassTags();
-};
-
-window.removeClass = (idx) => {
-  classes.splice(idx, 1);
-  redrawClassTags();
-};
-
-window.saveClasses = async () => {
-  if (!project) { IA.toast('No project', 'error'); return; }
-  const res = await IA.api(`/api/projects/${projectId}/classes`, {
-    method: 'PATCH',
-    body: JSON.stringify({ classes }),
-  });
-  if (res && res.ok) {
-    const updated = await res.json();
-    project.classes = updated.classes;
-    IA.toast('Classes saved ✓', 'success');
-  } else {
-    const e = await res?.json();
-    IA.toast(IA.formatError(e), 'error');
-  }
-};
-
-// ── Export ────────────────────────────────────────────────────────────
-
-function getSplitValues() {
-  return {
-    train: parseInt(document.getElementById('sl-train').value) / 100,
-    valid: parseInt(document.getElementById('sl-valid').value) / 100,
-    test:  parseInt(document.getElementById('sl-test').value)  / 100,
-    include_test: document.getElementById('include-test').checked,
+  g.render = () => {
+    if (!g.items.length) { el.innerHTML = empty(); pager.innerHTML = ''; return; }
+    el.innerHTML = g.items.map((img, i) => `
+      <a class="thumb rise ${g.selected.has(img.id) ? 'selected' : ''}" style="--i:${Math.min(i, 12)}" data-id="${img.id}" data-i="${i}"
+         href="/projects/${PID}/annotate/${img.id}">
+        <div class="media"><img src="${IA.thumbUrl(img.id)}" alt="" loading="lazy" onerror="this.remove()"/><div class="ph">${IA.icon('image')}</div></div>
+        <div class="overlay-top"><span class="sel" role="checkbox" aria-checked="${g.selected.has(img.id)}">${IA.icon('check')}</span><span></span>${img.review_status === 'approved' ? `<span class="chip success">${IA.icon('check')}approved</span>` : img.review_status === 'rejected' ? `<span class="chip danger">${IA.icon('flag')}sent back</span>` : IA.stateChip(img.state)}</div>
+        <div class="meta"><div class="name" title="${IA.esc(img.filename)}">${IA.esc(img.filename)}</div>
+          <div class="sub"><span>${img.assigned_username ? IA.esc(img.assigned_username) : 'Unassigned'}</span>${img.box_count ? `<span>· ${IA.plural(img.box_count, 'box', 'boxes')}</span>` : ''}${img.is_background ? '<span>· background</span>' : ''}</div></div>
+      </a>`).join('');
+    IA.lazyFade(el);
+    pager.innerHTML = g.pages > 1 || g.total > 50 ? `
+      <span class="num">${IA.fmtNum((g.page - 1) * g.perPage + 1)}–${IA.fmtNum(Math.min(g.total, g.page * g.perPage))} of ${IA.fmtNum(g.total)}</span>
+      <div class="pages"><button class="btn btn-sm btn-icon" data-pg="-1" ${g.page <= 1 ? 'disabled' : ''} aria-label="Previous page">${IA.icon('chevron-left')}</button>
+        <span class="num">Page ${g.page} of ${g.pages}</span>
+        <button class="btn btn-sm btn-icon" data-pg="1" ${g.page >= g.pages ? 'disabled' : ''} aria-label="Next page">${IA.icon('chevron-right')}</button></div>` : '';
   };
+  g.toggle = (id, on) => {
+    on = on ?? !g.selected.has(id);
+    if (on) g.selected.add(id); else g.selected.delete(id);
+    const card = el.querySelector(`.thumb[data-id="${id}"]`);
+    card?.classList.toggle('selected', on);
+    card?.querySelector('.sel')?.setAttribute('aria-checked', on);
+  };
+  g.clear = () => { g.selected.clear(); el.querySelectorAll('.thumb.selected').forEach((c) => c.classList.remove('selected')); bulk.refresh(); };
+  el.addEventListener('click', (e) => {
+    const card = e.target.closest('.thumb');
+    if (!card) return;
+    const selecting = e.target.closest('.sel') || e.shiftKey || g.selected.size > 0;
+    if (!selecting || e.ctrlKey || e.metaKey) return;     // plain click opens the annotator
+    e.preventDefault();
+    const i = +card.dataset.i;
+    if (e.shiftKey && g.anchor !== null) {
+      const [a, b] = [Math.min(g.anchor, i), Math.max(g.anchor, i)];
+      g.items.slice(a, b + 1).forEach((img) => g.toggle(img.id, true));
+    } else {
+      g.toggle(card.dataset.id);
+      g.anchor = i;
+    }
+    bulk.refresh();
+  });
+  pager.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-pg]');
+    if (!b) return;
+    g.page += +b.dataset.pg;
+    g.anchor = null;                                   // indices refer to the old page
+    g.load();
+    el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  });
+  return g;
 }
 
-window.syncSliders = (changed) => {
-  const train = parseInt(document.getElementById('sl-train').value);
-  const valid = parseInt(document.getElementById('sl-valid').value);
-  const test  = parseInt(document.getElementById('sl-test').value);
-
-  let rem = 100 - { train, valid, test }[changed];
-  const others = ['train', 'valid', 'test'].filter(s => s !== changed);
-  const total_other = { train, valid, test };
-  const other_sum = others.reduce((a, s) => a + total_other[s], 0);
-
-  if (other_sum > 0) {
-    others.forEach(s => {
-      const adjusted = Math.round(total_other[s] * rem / other_sum);
-      document.getElementById(`sl-${s}`).value = adjusted;
+// ── Bulk action bar (acts on the grid of the visible section) ─────────────────
+const bulk = {
+  grid: null, actions: [],
+  set(grid, actions) { this.grid = grid; this.actions = actions; this.refresh(); },
+  refresh() {
+    const n = this.grid?.selected.size || 0;
+    $('bulkbar').classList.toggle('open', n > 0);
+    if (!n) return;
+    $('bulk-count').textContent = `${IA.fmtNum(n)} selected`;
+    const wrap = $('bulk-actions');
+    wrap.innerHTML = '';
+    this.actions.forEach((a) => {
+      const b = IA.h(`<button class="btn btn-sm ${a.variant || ''}">${a.icon ? IA.icon(a.icon) : ''}${IA.esc(a.label)}</button>`);
+      b.addEventListener('click', () => a.fn(b, [...this.grid.selected]));
+      wrap.appendChild(b);
     });
-  }
-
-  ['train', 'valid', 'test'].forEach(s => {
-    document.getElementById(`sv-${s}`).textContent = `${document.getElementById(`sl-${s}`).value}%`;
-  });
-
-  loadExportPreview();
-  buildYamlPreview();
+  },
 };
+$('bulk-clear').addEventListener('click', () => bulk.grid?.clear());
 
-async function loadExportPreview() {
-  const { train, valid, test, include_test } = getSplitValues();
-  const res = await IA.api(`/api/projects/${projectId}/export/preview?train_ratio=${train}&valid_ratio=${valid}&test_ratio=${test}&include_test=${include_test}`);
-  if (!res || !res.ok) return;
-  const d = await res.json();
-  const el = document.getElementById('export-preview');
-  if (el) {
-    el.innerHTML = `<strong>${d.total_ready}</strong> total images to export:<br>
-      <span style="color:var(--green)">Train: ${d.train_count}</span> &nbsp;·&nbsp;
-      <span style="color:var(--blue)">Valid: ${d.valid_count}</span> &nbsp;·&nbsp;
-      <span style="color:var(--orange)">Test: ${d.test_count}</span>`;
-  }
+function userMenu(anchor, onPick) {
+  IA.menu(anchor, users.map((u) => ({ label: `${u.username}${u.id === user.id ? ' (you)' : ''}`, icon: 'user', fn: () => onPick(u) })));
 }
 
-function buildYamlPreview() {
-  const { include_test } = getSplitValues();
-  const cls = project?.classes || [];
-  const names = cls.map(c => `'${c}'`).join(', ');
-  const safeName = (project?.name || '').replace(/[\\/:*?"<>|]/g, '').trim();
-  const folderName = `${safeName}_dataset`;
-  let yaml = `path: ./dataset/${folderName}\ntrain: train/images\nval: valid/images\n`;
-  if (include_test) yaml += `test: test/images\n`;
-  yaml += `\nnc: ${cls.length}\nnames: [${names}]`;
-  const el = document.getElementById('yaml-preview');
-  if (el) el.textContent = yaml;
+async function assignTo(u, ids, grid) {
+  try {
+    const r = await IA.post(`/api/projects/${PID}/images/assign`, { image_ids: ids, user_id: u.id });
+    IA.toast(r.detail, r.skipped ? 'warn' : 'success');
+    grid.clear(); grid.load(); loadPeople();
+  } catch (e) { IA.toast(e.message, 'error'); }
 }
 
-window.runExport = async () => {
-  const { train, valid, test, include_test } = getSplitValues();
-  if (Math.abs(train + valid + (include_test ? test : 0) - 1.0) > 0.01) {
-    IA.toast('Ratios must sum to 100%', 'error'); return;
-  }
-
-  const btn = document.getElementById('export-btn');
-  btn.disabled = true;
-  document.getElementById('export-progress').classList.remove('hidden');
-  document.getElementById('export-result').classList.add('hidden');
-
-  const res = await IA.api(`/api/projects/${projectId}/export`, {
-    method: 'POST',
-    body: JSON.stringify({ train_ratio: train, valid_ratio: valid, test_ratio: test, include_test }),
+async function deleteImages(ids, grid) {
+  const ok = await IA.confirm({
+    title: `Delete ${IA.plural(ids.length, 'image')}?`,
+    message: 'They are removed from the project together with their boxes. The files on disk are not deleted.',
+    confirmLabel: 'Delete', danger: true,
   });
+  if (!ok) return;
+  try {
+    const r = await IA.post(`/api/projects/${PID}/images/delete`, { image_ids: ids });
+    IA.toast(r.deleted === ids.length ? `Deleted ${IA.plural(r.deleted, 'image')}` : `${r.deleted} of ${ids.length} deleted`, r.deleted === ids.length ? 'success' : 'warn');
+  } catch (e) { IA.toast(e.message, 'error'); }
+  grid.clear(); grid.load();
+}
 
+// ── Images section ────────────────────────────────────────────────────────────
+const FILTERS = [
+  ['', 'All', 'total'], ['unassigned', 'Unassigned', 'unassigned'], ['assigned,unannotated', 'To annotate', 'pending'],
+  ['annotated', 'Annotated', 'annotated'], ['ready_for_export', 'In dataset', 'ready_for_export'], ['exported', 'Exported', 'exported'],
+];
+let imgFilter = IA.store.get('ia_dash_filter', '');
+$('img-filter').innerHTML = FILTERS.map(([v, l, k]) => `<button data-v="${v}" data-k="${k}" class="${v === imgFilter ? 'active' : ''}">${l} <span class="count"></span></button>`).join('');
+function renderFilterCounts() {
+  $('img-filter').querySelectorAll('button').forEach((b) => { b.querySelector('.count').textContent = IA.fmtNum(stats[b.dataset.k] || 0); });
+  IA.segSync($('img-filter'));
+}
+const imagesGrid = makeGrid({
+  el: $('img-grid'), pager: $('img-pager'),
+  params: () => ({ ...(imgFilter ? { state: imgFilter } : {}), ...($('img-assignee').value ? { assigned_to: $('img-assignee').value } : {}) }),
+  empty: () => `<div class="empty"><div class="empty-art">${IA.icon('images')}</div><h3>No images here</h3><p>${stats.total ? 'Nothing matches this filter.' : 'Import a folder or extract frames from a video to get started.'}</p>${stats.total ? '' : '<a class="btn btn-primary" href="#import">Import images</a>'}</div>`,
+});
+$('img-filter').addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  imgFilter = b.dataset.v;
+  IA.store.set('ia_dash_filter', imgFilter);
+  $('img-filter').querySelectorAll('button').forEach((x) => x.classList.toggle('active', x === b));
+  IA.segSync($('img-filter'));
+  imagesGrid.clear();
+  imagesGrid.load(true);
+});
+$('img-assignee').addEventListener('change', () => { imagesGrid.clear(); imagesGrid.load(true); });
+$('img-per-page').addEventListener('change', (e) => { imagesGrid.perPage = +e.target.value; imagesGrid.load(true); });
+const imageActions = [
+  { label: 'Assign to…', icon: 'user-plus', fn: (b, ids) => userMenu(b, (u) => assignTo(u, ids, imagesGrid)) },
+  { label: 'Unassign', icon: 'x', fn: async (_b, ids) => {
+    try { const r = await IA.post(`/api/projects/${PID}/images/unassign`, { image_ids: ids }); IA.toast(r.detail, 'success'); imagesGrid.clear(); imagesGrid.load(); loadPeople(); }
+    catch (e) { IA.toast(e.message, 'error'); }
+  } },
+  { label: 'Delete', icon: 'trash-2', variant: 'btn-danger', fn: (_b, ids) => deleteImages(ids, imagesGrid) },
+];
+
+// ── Video → frames ────────────────────────────────────────────────────────────
+let videoInfo = null;
+let vidFormat = 'jpg';
+IA.segSync($('vid-format'));
+$('vid-format').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  vidFormat = b.dataset.v;
+  $('vid-format').querySelectorAll('button').forEach((x) => x.classList.toggle('active', x === b));
+  IA.segSync($('vid-format'));
+  estimate();
+});
+async function probeVideo() {
+  const path = $('vid-path').value.trim();
+  videoInfo = null;
+  if (!path) { $('vid-info').textContent = 'MP4, MKV, AVI, MOV or WEBM.'; estimate(); return; }
+  $('vid-info').textContent = 'Reading video…';
+  try {
+    videoInfo = await IA.post('/api/video/stats', { filepath: path });
+    const mins = Math.floor(videoInfo.duration / 60), secs = Math.round(videoInfo.duration % 60);
+    $('vid-info').textContent = `${videoInfo.resolution} · ${videoInfo.fps} fps · ${mins}:${String(secs).padStart(2, '0')} · ${videoInfo.codec}`;
+  } catch (e) { $('vid-info').textContent = e.message; }
+  estimate();
+}
+function estimate() {
+  const fps = parseFloat($('vid-fps').value);
+  const frames = videoInfo && fps > 0 ? Math.max(1, Math.round(videoInfo.duration * Math.min(fps, videoInfo.fps || fps))) : 0;
+  $('vid-estimate').textContent = frames ? `≈ ${IA.fmtNum(frames)} frames before skipping duplicates` : 'Lower = fewer, more varied frames.';
+  const disk = $('vid-disk');
+  if (!frames || !videoInfo.bytes_per_pixel) { disk.textContent = ''; return; }
+  const [w, h] = String(videoInfo.resolution).split('x').map(Number);
+  const bytes = frames * (w || 1920) * (h || 1080) * videoInfo.bytes_per_pixel[vidFormat];
+  const free = videoInfo.free_bytes - 1024 ** 3;
+  disk.innerHTML = bytes > free
+    ? `<span style="color:var(--danger)">Needs about ${IA.fmtBytes(bytes)} but only ${IA.fmtBytes(Math.max(0, free))} is free — lower the fps or use JPG.</span>`
+    : `Up to about ${IA.fmtBytes(bytes)} on disk (${IA.fmtBytes(videoInfo.free_bytes)} free).`;
+}
+$('vid-path').addEventListener('change', probeVideo);
+$('vid-fps').addEventListener('input', estimate);
+$('vid-browse').addEventListener('click', (e) => IA.busy(e.currentTarget, async () => {
+  IA.toast('The file dialog opens on the server screen', 'info', 2500);
+  try { $('vid-path').value = (await IA.get('/api/video/pick_import')).filepath; await probeVideo(); }
+  catch (err) { if (err.status !== 400) IA.toast(err.message, 'error'); }
+}));
+$('vid-go').addEventListener('click', (e) => IA.busy(e.currentTarget, async () => {
+  const filepath = $('vid-path').value.trim();
+  const fps = parseFloat($('vid-fps').value);
+  const res = $('vid-result');
+  res.innerHTML = '';
+  if (!filepath) { IA.toast('Choose a video first', 'warn'); return; }
+  if (!(fps > 0)) { IA.toast('Frames per second must be greater than 0', 'warn'); return; }
+  $('vid-progress-wrap').classList.remove('hidden');
+  setVideoProgress(0, 'Extracting frames…');
+  try {
+    const ex = await IA.post('/api/video/extract_frames', { filepath, fps, project_id: PID, image_format: vidFormat, dedupe: +$('vid-dedupe').value });
+    setVideoProgress(100, `Importing ${IA.fmtNum(ex.frames)} frames…`);
+    $('vid-bar').parentElement.classList.add('indeterminate');
+    const imp = await IA.post(`/api/projects/${PID}/import`, { folder_path: ex.folder_path });
+    const dup = ex.removed_duplicates ? ` ${IA.fmtNum(ex.removed_duplicates)} near-identical frames were skipped.` : '';
+    res.innerHTML = `<div class="callout success">${IA.icon('circle-check')}<div>Imported <b>${IA.fmtNum(imp.imported)}</b> frames in order.${dup} <a class="link" href="#assign">Assign them</a> or <a class="link" href="/projects/${PID}/view">start annotating</a>.</div></div>`;
+    await refreshProject();
+  } catch (err) {
+    res.innerHTML = `<div class="callout danger">${IA.icon('circle-alert')}<div>${IA.esc(err.message)}</div></div>`;
+  } finally {
+    $('vid-bar').parentElement.classList.remove('indeterminate');
+    $('vid-progress-wrap').classList.add('hidden');
+  }
+}));
+function setVideoProgress(pct, stage) {
+  $('vid-bar').style.width = `${pct}%`;
+  $('vid-pct').textContent = `${Math.round(pct)}%`;
+  if (stage) $('vid-stage').textContent = stage;
+}
+
+// ── Import ────────────────────────────────────────────────────────────────────
+async function pickFolder(input) {
+  IA.toast('The folder dialog opens on the server screen', 'info', 2500);
+  try { input.value = (await IA.get('/api/train/pick-dataset')).path; }
+  catch (err) { if (err.status !== 400) IA.toast(err.message, 'error'); }
+}
+$('imp-browse').addEventListener('click', (e) => IA.busy(e.currentTarget, () => pickFolder($('imp-path'))));
+$('rel-browse').addEventListener('click', (e) => IA.busy(e.currentTarget, () => pickFolder($('rel-path'))));
+$('imp-go').addEventListener('click', (e) => IA.busy(e.currentTarget, async () => {
+  const folder_path = $('imp-path').value.trim();
+  if (!folder_path) { IA.toast('Enter a folder path or use Browse…', 'warn'); return; }
+  const out = $('imp-result');
+  try {
+    const r = await IA.post(`/api/projects/${PID}/import`, { folder_path, include_subfolders: $('imp-recursive').checked });
+    out.innerHTML = `<div class="callout success">${IA.icon('circle-check')}<div>Imported <b>${IA.fmtNum(r.imported)}</b> images${r.skipped ? ` · ${IA.fmtNum(r.skipped)} skipped (already in the project or unreadable)` : ''}. <a class="link" href="#assign">Assign them →</a></div></div>`;
+    await refreshProject();
+  } catch (err) { out.innerHTML = `<div class="callout danger">${IA.icon('circle-alert')}<div>${IA.esc(err.message)}</div></div>`; }
+}));
+$('chk-go').addEventListener('click', (e) => IA.busy(e.currentTarget, async () => {
+  try {
+    const r = await IA.get(`/api/projects/${PID}/files/check`);
+    $('chk-result').innerHTML = r.missing
+      ? `<span style="color:var(--warning)">${IA.fmtNum(r.missing)} of ${IA.fmtNum(r.total)} files missing</span> — last seen in <code>${IA.esc(r.missing_folders[0] || '')}</code>`
+      : `All ${IA.fmtNum(r.total)} files found.`;
+  } catch (err) { IA.toast(err.message, 'error'); }
+}));
+$('rel-go').addEventListener('click', (e) => IA.busy(e.currentTarget, async () => {
+  const folder_path = $('rel-path').value.trim();
+  if (!folder_path) { IA.toast('Enter the new folder', 'warn'); return; }
+  try {
+    const r = await IA.post(`/api/projects/${PID}/files/relink`, { folder_path });
+    IA.toast(`Relinked ${IA.plural(r.relinked, 'file')}${r.unresolved ? ` · ${r.unresolved} still not found` : ''}`, r.unresolved ? 'warn' : 'success');
+    $('chk-result').textContent = '';
+    await refreshProject();
+  } catch (err) { IA.toast(err.message, 'error'); }
+}));
+
+// ── Assign ────────────────────────────────────────────────────────────────────
+let strategy = 'contiguous';
+const storedUsers = IA.store.get(`ia_assign_users_${PID}`, null);
+const checkedUsers = new Set(storedUsers || []);
+let assignDefaulted = storedUsers !== null;
+function renderAssignUsers() {
+  if (!users.length) { $('as-users').innerHTML = '<p class="small muted">No users yet. <a class="link" href="/users">Create one</a>.</p>'; return; }
+  // First visit only: preselect the annotators. After that an empty selection stays empty.
+  if (!assignDefaulted) { users.filter((u) => !u.is_admin).forEach((u) => checkedUsers.add(u.id)); assignDefaulted = true; }
+  $('as-users').innerHTML = users.map((u) => `
+    <label><span class="check"><input type="checkbox" data-uid="${u.id}" ${checkedUsers.has(u.id) ? 'checked' : ''}/></span>
+      ${IA.avatar(u.username)}<span class="nm">${IA.esc(u.username)}${u.is_admin ? ' <span class="muted small">admin</span>' : ''}</span>
+      <span class="n">${IA.fmtNum(workloads[u.id]?.total || 0)} images</span></label>`).join('');
+  renderPlan();
+}
+$('as-users').addEventListener('change', (e) => {
+  const cb = e.target.closest('[data-uid]'); if (!cb) return;
+  if (cb.checked) checkedUsers.add(cb.dataset.uid); else checkedUsers.delete(cb.dataset.uid);
+  IA.store.set(`ia_assign_users_${PID}`, [...checkedUsers]);
+  renderPlan();
+});
+$('as-all').addEventListener('click', () => { users.forEach((u) => checkedUsers.add(u.id)); IA.store.set(`ia_assign_users_${PID}`, [...checkedUsers]); renderAssignUsers(); });
+$('as-none').addEventListener('click', () => { checkedUsers.clear(); IA.store.set(`ia_assign_users_${PID}`, []); renderAssignUsers(); });
+IA.segSync($('as-strategy'));
+$('as-strategy').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  strategy = b.dataset.v;
+  $('as-strategy').querySelectorAll('button').forEach((x) => x.classList.toggle('active', x === b));
+  IA.segSync($('as-strategy'));
+  $('as-strategy-hint').textContent = strategy === 'contiguous'
+    ? 'Each person gets one continuous run of frames — best for video, and needed for carry / propagate.'
+    : 'Images are dealt out one by one. Use for unrelated photos when you want everyone to see a mix.';
+  renderPlan();
+});
+function renderPlan() {
+  const k = [...checkedUsers].filter((id) => users.some((u) => u.id === id)).length;
+  const sel = assignGrid?.selected.size || 0;
+  const n = sel || stats.unassigned || 0;
+  const btn = $('as-go');
+  if (!k || !n) {
+    $('as-plan').innerHTML = !k ? 'Pick at least one person.' : 'There are no unassigned images.';
+    btn.disabled = true;
+    return;
+  }
   btn.disabled = false;
-  document.getElementById('export-progress').classList.add('hidden');
+  const each = Math.floor(n / k), extra = n % k;
+  $('as-plan').innerHTML = `<b>${IA.fmtNum(n)}</b> ${sel ? 'selected' : 'unassigned'} images → <b>${k}</b> ${k === 1 ? 'person' : 'people'}: ` +
+    (each ? `${IA.fmtNum(each)} each${extra ? `, ${extra} get one more` : ''}` : `${extra} get one each`) +
+    (strategy === 'contiguous' ? ', as consecutive ranges.' : ', dealt in turn.');
+}
+$('as-go').addEventListener('click', (e) => IA.busy(e.currentTarget, async () => {
+  const body = { user_ids: [...checkedUsers].filter((id) => users.some((u) => u.id === id)), strategy };
+  if (assignGrid.selected.size) body.image_ids = [...assignGrid.selected];
+  try {
+    const r = await IA.post(`/api/projects/${PID}/images/auto-assign`, body);
+    IA.toast(r.detail, 'success');
+    assignGrid.clear(); assignGrid.load(true); loadPeople();
+  } catch (err) { IA.toast(err.message, 'error'); }
+}));
+const assignGrid = makeGrid({
+  el: $('as-grid'), pager: $('as-pager'),
+  params: () => ({ state: 'unassigned' }),
+  empty: () => `<div class="empty"><div class="empty-art">${IA.icon('check')}</div><h3>Everything is assigned</h3><p>New imports will show up here.</p></div>`,
+  onChange: (g) => { $('as-count').textContent = IA.fmtNum(g.total); renderPlan(); },
+});
+$('as-page-all').addEventListener('click', () => { assignGrid.items.forEach((i) => assignGrid.toggle(i.id, true)); bulk.refresh(); renderPlan(); });
+const assignActions = [
+  { label: 'Assign to…', icon: 'user-plus', fn: (b, ids) => userMenu(b, (u) => assignTo(u, ids, assignGrid)) },
+  { label: 'Assign to me', icon: 'user', fn: (_b, ids) => assignTo(user, ids, assignGrid) },
+];
+$('as-grid').addEventListener('click', () => setTimeout(renderPlan, 0));
 
-  if (res && res.ok) {
-    const d = await res.json();
-    const resultEl = document.getElementById('export-result');
-    resultEl.classList.remove('hidden');
-    resultEl.innerHTML = `<div class="export-result">
-      <h3>✓ Export Complete</h3>
-      <div style="font-size:13px;display:grid;grid-template-columns:repeat(4,auto);gap:16px;width:fit-content">
-        <div>Total: <strong>${d.exported}</strong></div>
-        <div style="color:var(--green)">Train: <strong>${d.train}</strong></div>
-        <div style="color:var(--blue)">Valid: <strong>${d.valid}</strong></div>
-        <div style="color:var(--orange)">Test: <strong>${d.test}</strong></div>
-      </div>
-      <div style="font-size:12px;color:var(--text-secondary);margin-top:8px">Output: <code>${d.output_path}</code></div>
-      ${d.orphan_warnings.length > 0 ? `<div style="color:var(--yellow);font-size:12px;margin-top:8px">⚠ ${d.orphan_warnings.length} annotation(s) skipped (class mismatch)</div>` : ''}
-    </div>`;
-    await loadStats();
-    await loadExportedImages();
-  } else {
-    const e = await res?.json();
-    IA.toast(IA.formatError(e) || 'Export failed', 'error');
+// ── Review ────────────────────────────────────────────────────────────────────
+let rvFilter = IA.store.get('ia_review_filter', 'awaiting_review');
+const reviewGrid = makeGrid({
+  el: $('rv-grid'), pager: $('rv-pager'),
+  params: () => ({ state: rvFilter }),
+  empty: () => `<div class="empty"><div class="empty-art">${IA.icon('check-check')}</div><h3>${rvFilter === 'awaiting_review' ? 'Nothing waiting' : 'Nothing here'}</h3><p>${rvFilter === 'awaiting_review' ? 'Frames appear here once annotators add them to the dataset.' : 'Try another filter.'}</p></div>`,
+});
+$('rv-filter').querySelectorAll('button').forEach((b) => b.classList.toggle('active', b.dataset.v === rvFilter));
+$('rv-filter').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  rvFilter = b.dataset.v;
+  IA.store.set('ia_review_filter', rvFilter);
+  $('rv-filter').querySelectorAll('button').forEach((x) => x.classList.toggle('active', x === b));
+  IA.segSync($('rv-filter'));
+  reviewGrid.clear(); reviewGrid.load(true);
+});
+async function reviewAction(ids, action) {
+  let note = null;
+  if (action === 'reject') {
+    note = await IA.prompt({ title: `Send back ${IA.plural(ids.length, 'frame')}?`, label: 'What should the annotator fix? (they see this on the frame)',
+      placeholder: 'e.g. boxes too loose; the second car is missing', confirmLabel: 'Send back', validate: (v) => (v.trim() ? '' : 'Write a short note') });
+    if (note === null) return;
   }
-};
+  try {
+    const r = await IA.post(`/api/projects/${PID}/images/review`, { image_ids: ids, action, note });
+    IA.toast(r.detail + (r.skipped ? ` · ${r.skipped} skipped` : ''), r.skipped ? 'warn' : 'success');
+    reviewGrid.clear(); reviewGrid.load(); loadStats(); loadPeople();
+  } catch (e) { IA.toast(e.message, 'error'); }
+}
+// Admin: submit every annotated image in the project (all annotators), not just your own
+$('rv-submit-all').addEventListener('click', (e) => IA.busy(e.currentTarget, async () => {
+  try {
+    const r = await IA.post(`/api/projects/${PID}/images/submit-all-annotated`);
+    IA.toast(r.detail, r.skipped_empty ? 'warn' : 'success', r.skipped_empty ? 7000 : 3500);
+    reviewGrid.load();
+    loadStats();
+  } catch (err) { IA.toast(err.message, 'error'); }
+}));
+const reviewActions = [
+  { label: 'Approve', icon: 'check', variant: 'btn-success', fn: (_b, ids) => reviewAction(ids, 'approve') },
+  { label: 'Send back…', icon: 'flag', fn: (_b, ids) => reviewAction(ids, 'reject') },
+  { label: 'Delete', icon: 'trash-2', variant: 'btn-danger', fn: (_b, ids) => deleteImages(ids, reviewGrid) },
+];
 
-// ── Socket ────────────────────────────────────────────────────────────
+// ── Classes ───────────────────────────────────────────────────────────────────
+let clsRows = [];
+let usage = {};
+async function loadClasses() {
+  clsRows = project.classes.map((c) => ({ orig: c, name: c }));
+  try { usage = await IA.get(`/api/projects/${PID}/classes/usage`); } catch { usage = {}; }
+  renderClasses();
+}
+function clsDirty() {
+  const names = clsRows.map((r) => r.name.trim());
+  return JSON.stringify(names) !== JSON.stringify(project.classes);
+}
+function renderClasses() {
+  const list = $('cls-list');
+  list.innerHTML = clsRows.map((r, i) => `
+    <div class="class-row" draggable="true" data-i="${i}">
+      <span class="grip">${IA.icon('grid-2x2', 'i-sm')}</span>
+      <span class="idx">${i}</span>
+      <div class="row" style="gap:8px;flex-wrap:nowrap;min-width:0"><span class="sw" style="--c:${IA.classColor(i)}"></span><input value="${IA.esc(r.name)}" data-i="${i}" aria-label="Class name"/></div>
+      <span class="cnt">${r.orig && usage[r.orig] ? IA.plural(usage[r.orig].boxes, 'box', 'boxes') : ''}</span>
+      <button class="btn btn-ghost btn-icon btn-sm" data-del="${i}" aria-label="Remove class">${IA.icon('trash-2')}</button>
+    </div>`).join('');
+  const orphans = Object.keys(usage).filter((n) => !project.classes.includes(n));
+  if (orphans.length) {
+    list.insertAdjacentHTML('beforeend', `<div class="callout warn">${IA.icon('circle-alert')}<div>Boxes use classes that are not in the list: ${orphans.map((o) => `<b>${IA.esc(o)}</b> (${usage[o].boxes})`).join(', ')}. Add the class back to include them in exports.</div></div>`);
+  }
+  $('cls-dirty').textContent = clsDirty() ? 'Unsaved changes' : '';
+}
+$('cls-list').addEventListener('input', (e) => {
+  const inp = e.target.closest('input[data-i]'); if (!inp) return;
+  clsRows[+inp.dataset.i].name = inp.value;
+  $('cls-dirty').textContent = clsDirty() ? 'Unsaved changes' : '';
+});
+$('cls-list').addEventListener('click', async (e) => {
+  const del = e.target.closest('[data-del]'); if (!del) return;
+  const r = clsRows[+del.dataset.del];
+  const used = r.orig && usage[r.orig]?.boxes;
+  if (used && !(await IA.confirm({ title: `Remove “${r.orig}”?`, message: `${IA.plural(used, 'box', 'boxes')} use this class. They are kept but excluded from exports until the class is added back.`, confirmLabel: 'Remove', danger: true }))) return;
+  clsRows.splice(+del.dataset.del, 1);
+  renderClasses();
+});
+let dragFrom = null;
+$('cls-list').addEventListener('dragstart', (e) => { const row = e.target.closest('.class-row'); if (!row) return; dragFrom = +row.dataset.i; row.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; });
+$('cls-list').addEventListener('dragover', (e) => { const row = e.target.closest('.class-row'); if (!row) return; e.preventDefault(); $('cls-list').querySelectorAll('.over').forEach((x) => x.classList.remove('over')); row.classList.add('over'); });
+$('cls-list').addEventListener('drop', (e) => {
+  const row = e.target.closest('.class-row'); if (!row || dragFrom === null) return;
+  e.preventDefault();
+  const [moved] = clsRows.splice(dragFrom, 1);
+  clsRows.splice(+row.dataset.i, 0, moved);
+  dragFrom = null;
+  renderClasses();
+});
+$('cls-list').addEventListener('dragend', () => { dragFrom = null; $('cls-list').querySelectorAll('.dragging,.over').forEach((x) => x.classList.remove('dragging', 'over')); });
+function addClass() {
+  const v = $('cls-new').value.trim();
+  if (!v) return;
+  if (clsRows.some((r) => r.name.trim() === v)) { IA.toast('That class already exists', 'warn'); return; }
+  clsRows.push({ orig: project.classes.includes(v) ? v : null, name: v });
+  $('cls-new').value = '';
+  renderClasses();
+}
+$('cls-add').addEventListener('click', addClass);
+$('cls-new').addEventListener('keydown', (e) => { if (e.key === 'Enter') addClass(); });
+$('cls-reset').addEventListener('click', loadClasses);
+$('cls-save').addEventListener('click', (e) => IA.busy(e.currentTarget, async () => {
+  const classes = clsRows.map((r) => r.name.trim());
+  if (classes.some((c) => !c)) { IA.toast('Class names cannot be empty', 'warn'); return; }
+  if (new Set(classes).size !== classes.length) { IA.toast('Class names must be unique', 'warn'); return; }
+  const renames = {};
+  clsRows.forEach((r) => { if (r.orig && r.orig !== r.name.trim()) renames[r.orig] = r.name.trim(); });
+  try {
+    project = await IA.patch(`/api/projects/${PID}/classes`, { classes, renames });
+    IA.toast('Classes saved', 'success');
+    renderHeader();
+    await loadClasses();
+  } catch (err) { IA.toast(err.message, 'error'); }
+}));
 
-function initSocket() {
-  const socket = IA.connectSocket(projectId, () => {});
-
-  socket?.on('stats_update', updateStats);
-
-  socket?.on('annotation_saved', ({ image_id, box_count, saved_by }) => {
-    addFeedItem(`<strong>${saved_by}</strong> saved ${box_count} box(es) on image <code>${image_id.slice(0,8)}…</code>`);
-  });
-
-  socket?.on('image_state_change', ({ image_id, new_state }) => {
-    addFeedItem(`Image state → <strong>${new_state}</strong>`);
-  });
-
-  socket?.on('export_progress', ({ percent }) => {
-    const fill = document.getElementById('export-prog-fill');
-    const pct  = document.getElementById('export-pct');
-    if (fill) fill.style.width = `${percent}%`;
-    if (pct)  pct.textContent  = `${percent}%`;
-  });
-
-  // If project deleted by another admin, bounce home
-  socket?.on('projects_changed', async () => {
-    const res = await fetch(`/api/projects/${projectId}`, {
-      headers: { 'Authorization': `Bearer ${IA.getToken()}` }
+// ── Export ────────────────────────────────────────────────────────────────────
+const split = IA.store.get(`ia_split_${PID}`, { train: 80, valid: 10, test: 10 });
+function renderSplit() {
+  const incTest = $('ex-test').checked;
+  const parts = incTest ? [['train', 'Train'], ['valid', 'Valid'], ['test', 'Test']] : [['train', 'Train'], ['valid', 'Valid']];
+  if (!incTest) { split.train = 100 - split.valid; }
+  $('ex-split').innerHTML = parts.map(([k, l]) => `<div class="seg-part split-${k}" data-k="${k}" style="flex-basis:${split[k]}%" title="${l} ${split[k]}%">${split[k] >= 18 ? `${l} ` : ''}${split[k] >= 7 ? `${split[k]}%` : ''}</div>`).join('')
+    + `<span class="handle" data-h="0" style="left:${split.train}%"></span>`
+    + (incTest ? `<span class="handle" data-h="1" style="left:${split.train + split.valid}%"></span>` : '');
+  let legend = $('ex-legend');
+  if (!legend) { legend = IA.h('<div class="legend" id="ex-legend"></div>'); $('ex-split').after(legend); }
+  legend.innerHTML = parts.map(([k, l]) => `<span><i class="split-${k}"></i>${l} ${split[k]}% <b class="num" data-n="${k}"></b></span>`).join('');
+}
+// Dragging is tracked on window: re-rendering the bar replaces the handle under the pointer
+let dragH = null;
+const MIN_VALID = 5;                 // YOLO needs validation images to report accuracy
+$('ex-split').addEventListener('pointerdown', (e) => { const h = e.target.closest('.handle'); if (!h) return; e.preventDefault(); dragH = +h.dataset.h; });
+window.addEventListener('pointermove', (e) => {
+  if (dragH === null) return;
+  const r = $('ex-split').getBoundingClientRect();
+  const pct = Math.round(Math.max(0, Math.min(100, ((e.clientX - r.left) / r.width) * 100)));
+  // Two boundaries: b1 = end of train, b2 = end of valid (100 when there is no test split)
+  const hasTest = $('ex-test').checked;
+  let b1 = split.train, b2 = hasTest ? split.train + split.valid : 100;
+  if (dragH === 0) b1 = Math.max(5, Math.min(pct, b2 - MIN_VALID));
+  else b2 = Math.max(b1 + MIN_VALID, Math.min(100, pct));
+  Object.assign(split, { train: b1, valid: b2 - b1, test: hasTest ? 100 - b2 : 0 });
+  renderSplit();
+});
+window.addEventListener('pointerup', () => { if (dragH === null) return; dragH = null; IA.store.set(`ia_split_${PID}`, split); previewExport(); });
+$('ex-test').addEventListener('change', () => {
+  if ($('ex-test').checked && !split.test) { split.test = 10; split.train = Math.max(5, 100 - split.valid - split.test); }
+  if (!$('ex-test').checked) split.test = 0;
+  renderSplit(); previewExport();
+});
+$('ex-group').addEventListener('change', previewExport);
+$('ex-approved').addEventListener('change', previewExport);
+const ratios = () => ({ train_ratio: split.train / 100, valid_ratio: split.valid / 100, test_ratio: ($('ex-test').checked ? split.test : 0) / 100,
+  include_test: $('ex-test').checked, group_sequences: $('ex-group').checked, only_approved: $('ex-approved').checked });
+async function previewExport() {
+  try {
+    const q = new URLSearchParams(ratios());
+    const [p, y] = await Promise.all([
+      IA.get(`/api/projects/${PID}/export/preview?${q}`),
+      IA.get(`/api/projects/${PID}/export/yaml-preview?include_test=${$('ex-test').checked}`),
+    ]);
+    $('ex-total').textContent = `${IA.plural(p.total_ready, 'image')}${$('ex-approved').checked ? ' approved' : ' in the dataset'}`;
+    [['train', p.train_count], ['valid', p.valid_count], ['test', p.test_count]].forEach(([k, n]) => {
+      const el = document.querySelector(`#ex-legend [data-n="${k}"]`); if (el) el.textContent = `· ${IA.plural(n, 'image')}`;
     });
-    if (res.status === 404) {
-      IA.toast('This project was deleted', 'error');
-      setTimeout(() => { window.location.href = '/home'; }, 2000);
+    $('ex-yaml').textContent = y.yaml;
+    $('ex-out').textContent = y.output_path.split(/[\\/]/).pop();
+    $('ex-go').disabled = !p.total_ready;
+    $('cl-go').disabled = !p.total_ready;
+  } catch (err) { $('ex-yaml').textContent = err.message; }
+}
+$('ex-go').addEventListener('click', (e) => IA.busy(e.currentTarget, async () => {
+  $('ex-result').innerHTML = '';
+  $('ex-progress-wrap').classList.remove('hidden');
+  $('ex-bar').style.width = '0%';
+  try {
+    const r = await IA.post(`/api/projects/${PID}/export`, ratios());
+    const warn = r.orphan_warnings.length ? `<details style="margin-top:8px"><summary class="small">${IA.plural(r.orphan_warnings.length, 'warning')}</summary><ul class="small" style="margin:6px 0 0 18px">${r.orphan_warnings.slice(0, 50).map((w) => `<li>${IA.esc(w)}</li>`).join('')}</ul></details>` : '';
+    const linked = r.linked ? `<br/><span class="small">${IA.fmtNum(r.linked)} images hard-linked — no extra disk space used.</span>` : '';
+    $('ex-result').innerHTML = `<div class="callout success">${IA.icon('circle-check')}<div>Exported <b>${IA.fmtNum(r.exported)}</b> images — train ${IA.fmtNum(r.train)} · valid ${IA.fmtNum(r.valid)} · test ${IA.fmtNum(r.test)}<br/><code>${IA.esc(r.output_path)}</code>${linked}${warn}
+      <div class="row" style="margin-top:10px"><a class="btn btn-sm" href="/train">${IA.icon('cpu')}Train a model on it</a></div></div></div>`;
+    await previewExport();
+  } catch (err) { $('ex-result').innerHTML = `<div class="callout danger">${IA.icon('circle-alert')}<div>${IA.esc(err.message)}</div></div>`; }
+  finally { $('ex-progress-wrap').classList.add('hidden'); }
+}));
+
+// ── Background jobs (model assist, cloud bundles) ─────────────────────────────
+const jobPanels = {};               // panel key → {el, id, onDone}
+const panelKey = (job) => (job.kind === 'predict' ? `predict_${job.params?.mode}` : job.kind);
+function renderJob(el, job) {
+  const pct = Math.round(job.progress || 0);
+  const active = ['queued', 'running'].includes(job.status);
+  const label = { queued: 'Waiting…', running: job.message || 'Working…', done: job.message || 'Done', failed: job.message || 'Failed',
+                  cancelled: 'Cancelled', interrupted: 'Stopped when the server restarted' }[job.status] || job.status;
+  el.innerHTML = `<div class="job-box ${job.status}"><div class="row"><span>${IA.esc(label)}</span>${active ? `<button class="btn btn-ghost btn-sm" data-cancel="${job.id}">Cancel</button>` : `<span class="muted small">${IA.esc(IA.fmtRel(job.finished_at || job.created_at))}</span>`}</div>
+    ${active ? `<div class="progress"><span style="width:${pct}%"></span></div>` : ''}</div>`;
+}
+document.addEventListener('click', async (e) => {
+  const b = e.target.closest('[data-cancel]'); if (!b) return;
+  try { await IA.post(`/api/jobs/${b.dataset.cancel}/cancel`); } catch (err) { IA.toast(err.message, 'error'); }
+});
+function trackJob(key, job) {
+  const panel = jobPanels[key];
+  if (!panel) return;
+  panel.id = job.id;
+  renderJob(panel.el, job);
+  if (job.status === 'done') panel.onDone?.(job);
+}
+function onJobUpdate(job) {
+  if (job.project_id !== PID) return;
+  const key = panelKey(job);
+  if (jobPanels[key] && (jobPanels[key].id === job.id || !jobPanels[key].id)) trackJob(key, job);
+}
+async function restoreJobs() {
+  try {
+    const { jobs } = await IA.get(`/api/jobs?project_id=${PID}&limit=20`);
+    const seen = new Set();
+    for (const j of jobs) {                       // newest first: show the latest job of each kind
+      const key = panelKey(j);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (jobPanels[key]) { jobPanels[key].id = j.id; renderJob(jobPanels[key].el, j); jobPanels[key].onRestore?.(j); }
     }
-  });
+  } catch { /* ignore */ }
 }
 
-// ── Modal helpers ─────────────────────────────────────────────────────
-
-window.openModal = (title, bodyHtml, actionsHtml) => {
-  const titleEl   = document.getElementById('modal-title');
-  const bodyEl    = document.getElementById('modal-body');
-  const actionsEl = document.getElementById('modal-actions');
-  const overlayEl = document.getElementById('modal-overlay');
-
-  if (titleEl) titleEl.textContent = title;
-  if (bodyEl)  bodyEl.innerHTML = bodyHtml;
-  if (actionsEl) {
-    actionsEl.innerHTML = actionsHtml || '';
-  }
-  if (overlayEl) overlayEl.classList.remove('hidden');
-};
-
-window.closeModal = (e) => {
-  if (!e || e.target === document.getElementById('modal-overlay') || (e.target && e.target.classList.contains('close-modal-btn'))) {
-    document.getElementById('modal-overlay').classList.add('hidden');
-  }
-};
-
-window.runExportFromReview = async () => {
-  const { train, valid, test, include_test } = getSplitValues();
-  if (Math.abs(train + valid + (include_test ? test : 0) - 1.0) > 0.01) {
-    IA.toast('Ratios must sum to 100%', 'error'); return;
-  }
-
-  const btn = document.getElementById('review-export-btn');
-  if (btn) { btn.disabled = true; btn.textContent = '⏳ Exporting…'; }
-
-  const res = await IA.api(`/api/projects/${projectId}/export`, {
-    method: 'POST',
-    body: JSON.stringify({ train_ratio: train, valid_ratio: valid, test_ratio: test, include_test }),
+// Model assist
+let assistModels = [];
+async function loadAssist() {
+  // The device note needs the one-off torch probe (slow on first use) — never make the model list wait for it
+  IA.get('/api/system').then((sys) => {
+    const c = sys.compute;
+    $('as-device').textContent = c.cuda_available
+      ? `Runs on the GPU (${c.gpu_name || 'CUDA'}).`
+      : `Runs on the CPU (${c.cpu_cores} cores) — about 0.3 s per frame with a nano model. On a machine with an NVIDIA GPU this switches to the GPU automatically.`;
+  }).catch(() => {});
+  try {
+    const { models } = await IA.get('/api/assist/models');
+    assistModels = models.filter((m) => !m.is_last);
+    const sel = $('as-model');
+    const keep = sel.value || IA.store.get(`ia_assist_model_${PID}`, '');
+    sel.innerHTML = assistModels.length
+      ? assistModels.map((m) => `<option value="${IA.esc(m.name)}">${IA.esc(m.name)} · ${m.size_mb} MB · ${IA.esc(IA.fmtDate(m.modified))}</option>`).join('')
+      : '<option value="">No trained models yet</option>';
+    if (keep && assistModels.some((m) => m.name === keep)) sel.value = keep;
+    $('pl-go').disabled = $('qa-go').disabled = !assistModels.length;
+    $('as-model-hint').innerHTML = assistModels.length ? 'Any model trained here or imported from cloud training.'
+      : 'Train one under <a class="link" href="/train">Train model</a>, or use cloud training (Export section).';
+  } catch (e) { IA.toast(e.message, 'error'); }
+  await restoreJobs();
+  loadFindings();
+}
+$('as-model').addEventListener('change', (e) => IA.store.set(`ia_assist_model_${PID}`, e.target.value));
+$('pl-conf').addEventListener('input', (e) => { $('pl-conf-v').textContent = (+e.target.value).toFixed(2); });
+async function startPredict(mode, btn) {
+  const model = $('as-model').value;
+  if (!model) { IA.toast('Pick a model first', 'warn'); return; }
+  await IA.busy(btn, async () => {
+    try {
+      const body = mode === 'prelabel'
+        ? { model, mode, scope: 'todo', conf: +$('pl-conf').value }
+        : { model, mode, scope: 'labeled', conf: 0.1 };          // low threshold: the check needs the model's doubts too
+      trackJob(`predict_${mode}`, await IA.post(`/api/projects/${PID}/assist/predict`, body));
+    } catch (e) { IA.toast(e.message, 'error'); }
   });
-
-  if (btn) { btn.disabled = false; btn.textContent = '📦 Export all to Dataset'; }
-
-  if (res && res.ok) {
-    const d = await res.json();
-    const bodyHtml = `
-      <div style="font-size:14px; color:var(--text-secondary); line-height: 1.6;">
-        <p style="margin-bottom:12px; color:var(--green); font-weight:600; font-size:16px;">✓ Export completed successfully!</p>
-        <div style="display:grid; grid-template-columns: repeat(4, auto); gap: 16px; margin: 16px 0; padding: 12px; background:var(--bg-elevated); border-radius:var(--radius); border: 1px solid var(--border)">
-          <div>Total: <strong style="color:var(--text-primary)">${d.exported}</strong></div>
-          <div style="color:var(--green)">Train: <strong>${d.train}</strong></div>
-          <div style="color:var(--blue)">Valid: <strong>${d.valid}</strong></div>
-          <div style="color:var(--orange)">Test: <strong>${d.test}</strong></div>
-        </div>
-        <div style="margin-top:12px;">Output Path:</div>
-        <code style="display:block; padding:8px; background:var(--bg-elevated); border-radius:var(--radius); font-size:12px; color:var(--text-primary); border: 1px solid var(--border); overflow-x:auto;">${d.output_path}</code>
-        ${d.orphan_warnings.length > 0 ? `
-          <div style="margin-top:16px; color:var(--yellow); font-size:13px;">
-            <strong>⚠ Warnings:</strong>
-            <ul style="margin:4px 0 0 16px; padding:0;">
-              ${d.orphan_warnings.slice(0, 5).map(w => `<li>${w}</li>`).join('')}
-              ${d.orphan_warnings.length > 5 ? `<li>... and ${d.orphan_warnings.length - 5} more</li>` : ''}
-            </ul>
-          </div>
-        ` : ''}
-      </div>
-    `;
-    window.openModal('📦 Export Success', bodyHtml, `<button class="btn btn-primary close-modal-btn" onclick="closeModal()">Close</button>`);
-    await loadReviewSection();
-    await loadStats();
-    await loadExportedImages();
-  } else {
-    const e = await res?.json();
-    IA.toast(IA.formatError(e) || 'Export failed', 'error');
+}
+$('pl-go').addEventListener('click', (e) => startPredict('prelabel', e.currentTarget));
+$('qa-go').addEventListener('click', (e) => startPredict('check', e.currentTarget));
+let prelabelBatch = null;
+function showPrelabelResult(job) {
+  const r = job.result || {};
+  prelabelBatch = r.batch_id || null;
+  $('pl-undo').classList.toggle('hidden', !prelabelBatch);
+  const unknown = Object.keys(r.unknown_classes || {});
+  if (unknown.length) {
+    $('pl-job').insertAdjacentHTML('beforeend', `<div class="callout warn" style="margin-top:8px">${IA.icon('circle-alert')}<div>The model also found classes this project doesn't have: ${unknown.map((u) => `<b>${IA.esc(u)}</b>`).join(', ')}. Those boxes were left out — add the class (same name) to use them.</div></div>`);
   }
+}
+jobPanels.predict_prelabel = { el: $('pl-job'), onDone: (j) => { showPrelabelResult(j); loadStats(); }, onRestore: (j) => { if (j.status === 'done') showPrelabelResult(j); } };
+jobPanels.predict_check = { el: $('qa-job'), onDone: () => loadFindings() };
+$('pl-undo').addEventListener('click', (e) => IA.busy(e.currentTarget, async () => {
+  if (!prelabelBatch) return;
+  try {
+    const r = await IA.post(`/api/projects/${PID}/annotations/batches/${prelabelBatch}/undo`);
+    IA.toast(`Removed the suggestions from ${IA.plural(r.restored.length, 'frame')}${r.conflicts.length ? ` · ${r.conflicts.length} already edited and kept` : ''}`, 'success');
+    prelabelBatch = null; $('pl-undo').classList.add('hidden');
+  } catch (err) { IA.toast(err.message, 'error'); }
+}));
+const ISSUE = {
+  missed: (i) => `<span class="chip danger" title="The model sees an object nobody labelled">missed ${IA.esc(i.class_name)} ${Math.round(i.conf * 100)}%</span>`,
+  class: (i) => `<span class="chip warn" title="The model thinks this is a different class">${IA.esc(i.class_name)} → ${IA.esc(i.pred_class)}?</span>`,
+  loose: (i) => `<span class="chip" title="The box overlaps the model's box only partly (IoU ${i.iou})">loose ${IA.esc(i.class_name)} box</span>`,
+  extra: (i) => `<span class="chip" title="The model found nothing here — a false label or a hard case">unconfirmed ${IA.esc(i.class_name)}</span>`,
 };
-
-async function loadExportedImages() {
-  const res = await IA.api(`/api/projects/${projectId}/images?state=exported&per_page=200`);
-  if (!res || !res.ok) return;
-  const data = await res.json();
-  const grid = document.getElementById('exported-image-grid');
-  const countEl = document.getElementById('exported-count');
-  if (countEl) countEl.textContent = `${data.total} images`;
-
-  if (!grid) return;
-  if (data.items.length === 0) {
-    grid.innerHTML = '<div class="text-muted text-sm" style="padding:20px;grid-column:1/-1;text-align:center">No images exported yet.</div>';
-    return;
-  }
-  grid.innerHTML = data.items.map(img => `
-    <div class="img-thumb" title="${img.filename}" style="cursor:default">
-      <img src="${IA.imgUrl(img.id)}" alt="${img.filename}" loading="lazy" onerror="this.style.display='none'"/>
-    </div>
-  `).join('');
+async function loadFindings() {
+  try {
+    const r = await IA.get(`/api/projects/${PID}/assist/findings`);
+    const box = $('qa-findings');
+    if (!r.job_id) { box.innerHTML = '<p class="small muted">Run “Find label mistakes” to fill this list.</p>'; $('qa-meta').textContent = ''; return; }
+    const c = r.counts || {};
+    $('qa-meta').textContent = r.findings.length ? `${IA.plural(r.findings.length, 'frame')} · ${c.missed || 0} missed · ${c.class || 0} class · ${c.loose || 0} loose · ${c.extra || 0} unconfirmed` : '';
+    box.innerHTML = r.findings.length ? `<div class="findings">${r.findings.slice(0, 300).map((f) => `
+      <a class="finding" href="/projects/${PID}/annotate/${f.image_id}?qa=1">
+        <img src="${IA.thumbUrl(f.image_id, 160)}" alt="" loading="lazy" onerror="this.style.visibility='hidden'"/>
+        <div style="min-width:0"><div class="nm">${IA.esc(f.filename)} <span class="muted small">#${f.seq ?? ''}${f.assignee ? ` · ${IA.esc(f.assignee)}` : ''}</span></div>
+          <div class="issues">${f.issues.map((i) => ISSUE[i.type]?.(i) || '').join('')}</div></div>
+        ${IA.stateChip(f.state)}</a>`).join('')}</div>${r.findings.length > 300 ? `<p class="small muted">…and ${r.findings.length - 300} more</p>` : ''}`
+      : '<div class="callout success">' + IA.icon('circle-check') + '<div>The model agrees with the labels on every checked frame.</div></div>';
+  } catch (e) { $('qa-findings').innerHTML = `<p class="small muted">${IA.esc(e.message)}</p>`; }
 }
 
-// ── All Images Section (Admin Explorer) ────────────────────────────────
-let allImagesFilter = 'all';
-let allImagesPage = 1;
-let allImagesPerPage = 50;
-let allImagesTotalPages = 1;
-let allImagesShowPreviews = localStorage.getItem('ia_show_previews') !== 'false';
+// Cloud training bundles
+async function loadBundles() {
+  try {
+    const { bundles } = await IA.get('/api/cloud/bundles');
+    $('cl-list').innerHTML = bundles.length ? bundles.map((b) => `
+      <div class="bundle"><div style="min-width:0"><div class="nm" title="${IA.esc(b.name)}">${IA.esc(b.name)}</div><div class="small muted">${IA.fmtBytes(b.bytes)} · ${IA.esc(IA.fmtRel(b.created))}</div></div>
+        <div class="row" style="gap:4px"><a class="btn btn-sm" href="/api/cloud/bundles/${encodeURIComponent(b.name)}" download aria-label="Download">${IA.icon('download')}</a>
+          <button class="btn btn-ghost btn-sm btn-icon" data-del-bundle="${IA.esc(b.name)}" aria-label="Delete">${IA.icon('trash-2')}</button></div></div>`).join('')
+      : '<p class="small muted">None yet.</p>';
+  } catch { /* ignore */ }
+}
+$('cl-list').addEventListener('click', async (e) => {
+  const b = e.target.closest('[data-del-bundle]'); if (!b) return;
+  if (!(await IA.confirm({ title: 'Delete this bundle?', message: 'Only the .zip is removed — your images and labels are not affected.', confirmLabel: 'Delete', danger: true }))) return;
+  try { await IA.del(`/api/cloud/bundles/${encodeURIComponent(b.dataset.delBundle)}`); loadBundles(); } catch (err) { IA.toast(err.message, 'error'); }
+});
+jobPanels.cloud_bundle = { el: $('cl-job'), onDone: (j) => {
+  loadBundles();
+  const r = j.result || {};
+  $('cl-job').insertAdjacentHTML('beforeend', `<div class="callout success" style="margin-top:8px">${IA.icon('circle-check')}<div>
+    <b>${IA.esc(r.file || 'Bundle')}</b> is ready (${IA.fmtBytes(r.bytes)}). <a class="link" href="/api/cloud/bundles/${encodeURIComponent(r.file || '')}" download>Download it</a>, then follow README.md inside:
+    Kaggle → upload as a Dataset, import <code>train.ipynb</code>, turn on GPU + Internet, Run all. Colab → upload <code>train.ipynb</code> and the zip, Run all.</div></div>`);
+} };
+$('cl-go').addEventListener('click', (e) => IA.busy(e.currentTarget, async () => {
+  try {
+    const job = await IA.post(`/api/projects/${PID}/cloud-bundle`, {
+      ...ratios(), train: { model: $('cl-model').value, epochs: Math.max(1, parseInt($('cl-epochs').value, 10) || 100), imgsz: +$('cl-imgsz').value },
+    });
+    trackJob('cloud_bundle', job);
+  } catch (err) { IA.toast(err.message, 'error'); }
+}));
 
-async function loadAllImagesSection() {
-  const grid = document.getElementById('all-images-grid');
-  const paginationBar = document.getElementById('all-images-pagination');
-  if (!grid) return;
+// ── Routing ───────────────────────────────────────────────────────────────────
+const SECTIONS = {
+  overview: { title: 'Overview', nav: 'overview', load: () => { loadPeople(); checkFiles(); } },
+  images:   { title: 'All images', nav: 'images', load: () => imagesGrid.load(), bulk: [imagesGrid, imageActions] },
+  video:    { title: 'Video → frames', nav: 'video-frames', load: () => {} },
+  import:   { title: 'Import images', nav: 'import', load: () => {} },
+  assign:   { title: 'Assign', nav: 'assign', load: () => { assignGrid.load(); loadPeople(); }, bulk: [assignGrid, assignActions] },
+  review:   { title: 'Review', nav: 'review', load: () => reviewGrid.load(), bulk: [reviewGrid, reviewActions] },
+  assist:   { title: 'Model assist', nav: 'assist', load: () => loadAssist() },
+  classes:  { title: 'Classes', nav: 'classes', load: () => loadClasses() },
+  export:   { title: 'Export & cloud training', nav: 'export', load: () => { renderSplit(); previewExport(); loadBundles(); restoreJobs(); } },
+};
+let current = null;
+function route() {
+  const key = SECTIONS[location.hash.slice(1)] ? location.hash.slice(1) : 'overview';
+  if (current === 'classes' && key !== 'classes' && clsDirty()) IA.toast('Unsaved class changes were kept — come back to save them', 'warn');
+  current = key;
+  const s = SECTIONS[key];
+  document.querySelectorAll('.dash-section').forEach((el) => el.classList.toggle('active', el.dataset.section === key));
+  IA.setActiveNav(s.nav);
+  IA.setCrumbs([{ label: 'Projects', href: '/home' }, { label: project.name, href: '#overview' }, { label: s.title }]);
+  $('section-eyebrow').textContent = s.title;
+  bulk.grid?.selected.size && bulk.grid.clear();
+  bulk.set(s.bulk?.[0] || null, s.bulk?.[1] || []);
+  if (key === 'classes' && clsRows.length && clsDirty()) renderClasses(); else s.load();
+  requestAnimationFrame(() => document.querySelectorAll('.dash-section.active .seg').forEach(IA.segSync));
+}
+window.addEventListener('hashchange', route);
 
-  // Sync checkbox state
-  const checkbox = document.getElementById('all-images-show-previews');
-  if (checkbox) checkbox.checked = allImagesShowPreviews;
-
-  grid.innerHTML = `
-    <div style="color:var(--text-muted);font-size:13px;grid-column:1/-1;padding:40px 0;text-align:center">
-      <div class="spinner" style="margin:0 auto 12px"></div>
-      Loading images…
-    </div>`;
-
-  const params = new URLSearchParams({
-    page: allImagesPage,
-    per_page: allImagesPerPage,
-  });
-  if (allImagesFilter !== 'all') {
-    params.set('state', allImagesFilter);
-  }
-
-  const res = await IA.api(`/api/projects/${projectId}/images?${params}`);
-  if (!res || !res.ok) {
-    grid.innerHTML = '<div class="text-muted" style="grid-column:1/-1;padding:40px;text-align:center">Failed to load images.</div>';
-    return;
-  }
-
-  const data = await res.json();
-  const { items, total, page, per_page, total_pages } = data;
-
-  allImagesTotalPages = total_pages;
-  allImagesPage = page;
-
-  // Update count badge
-  const countBadge = document.getElementById('all-images-count-badge');
-  if (countBadge) {
-    countBadge.textContent = `${total} images`;
-  }
-
-  if (items.length === 0) {
-    grid.innerHTML = '<div class="text-muted text-sm" style="padding:20px;grid-column:1/-1;text-align:center">No images found matching this filter.</div>';
-    paginationBar.style.display = 'none';
-    return;
-  }
-
-  grid.innerHTML = items.map(img => {
-    const stateColor = IA.stateColor(img.state);
-    const stateBadgeText = img.state.toUpperCase().replace(/_/g, ' ');
-    const assigneeText = img.assigned_username 
-      ? `Assigned to: <strong>${img.assigned_username}</strong>` 
-      : '<span style="color:var(--text-muted)">Unassigned</span>';
-    
-    const thumbHtml = allImagesShowPreviews
-      ? `<img src="${IA.imgUrl(img.id)}" alt="${img.filename}" loading="lazy" onerror="this.style.display='none'"/>`
-      : `<div style="width:100%; height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; background:var(--bg-elevated); color:var(--text-muted); gap:8px;">
-           <span style="font-size:24px;">🖼️</span>
-           <span style="font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em;">Click to view/edit</span>
-         </div>`;
-
-    return `
-      <div class="pv-img-card" onclick="window.open('/projects/${projectId}/annotate/${img.id}', '_blank')">
-        <div class="card-thumb">
-          ${thumbHtml}
-          <div class="state-badge-overlay">
-            <span class="badge" style="background:${stateColor}; color:#fff; font-size:10px; font-weight:700; border:1px solid rgba(0,0,0,0.25);">${stateBadgeText}</span>
-          </div>
-        </div>
-        <div class="card-footer" style="display:flex; flex-direction:column; gap:4px;">
-          <div class="card-name" title="${img.filename}" style="font-weight:600; font-size:12px; color:var(--text-primary); margin-bottom:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${img.filename}</div>
-          <div style="font-size:11px; color:var(--text-secondary);">${assigneeText}</div>
-        </div>
-      </div>
-    `;
-  }).join('');
-
-  // Pagination controls
-  paginationBar.style.display = 'flex';
-  document.getElementById('all-page-current').textContent = allImagesPage;
-  document.getElementById('all-page-total').textContent = allImagesTotalPages;
-  document.getElementById('all-total-count').textContent = total;
-  document.getElementById('all-btn-prev').disabled = allImagesPage <= 1;
-  document.getElementById('all-btn-next').disabled = allImagesPage >= allImagesTotalPages;
+async function refreshProject() {
+  try { project = await IA.get(`/api/projects/${PID}`); renderHeader(); } catch { /* ignore */ }
+  loadStats();
+  checkFiles();
 }
 
-window.setAllImagesFilter = (filter) => {
-  allImagesFilter = filter;
-  allImagesPage = 1;
-  document.querySelectorAll('#section-all-images .filter-btn').forEach(btn => {
-    btn.classList.remove('active');
-  });
-  document.getElementById(`all-img-filter-${filter}`)?.classList.add('active');
-  loadAllImagesSection();
-};
+// ── Live updates ──────────────────────────────────────────────────────────────
+const socket = IA.connectSocket(PID);
+const reloadVisible = IA.debounce(() => {
+  if (current === 'images') imagesGrid.load();
+  if (current === 'assign') assignGrid.load();
+  if (current === 'review') reviewGrid.load();
+  if (current === 'overview') loadPeople();
+}, 600);
+socket?.on('stats_update', (s) => { if (!s.project_id || s.project_id === PID) applyStats(s); });
+socket?.on('annotation_saved', ({ image_id, box_count, saved_by }) => {
+  feed(saved_by, `<b>${IA.esc(saved_by)}</b> saved ${IA.plural(box_count, 'box', 'boxes')} on ${fileLabel(image_id)}`);
+});
+socket?.on('image_state_change', ({ image_id, new_state }) => {
+  if (new_state === 'ready_for_export') feed(null, `${fileLabel(image_id)} added to the dataset`);
+  reloadVisible();
+});
+socket?.on('image_state_change_bulk', ({ summary }) => { if (summary) feed(null, IA.esc(summary)); reloadVisible(); });
+socket?.on('annotations_bulk_saved', ({ saved_by, kind, image_ids }) => {
+  const verb = { propagate: 'propagated boxes to', interpolate: 'interpolated boxes on', undo: 'undid changes on', bulk: 'updated' }[kind] || 'updated';
+  feed(saved_by, `<b>${IA.esc(saved_by)}</b> ${verb} ${IA.plural(image_ids.length, 'frame')}`);
+  reloadVisible();
+});
+socket?.on('image_deleted', reloadVisible);
+socket?.on('export_progress', ({ percent }) => { $('ex-bar').style.width = `${percent}%`; $('ex-pct').textContent = `${percent}%`; });
+socket?.on('video_progress', ({ percent, stage }) => {
+  if (stage === 'extracting') setVideoProgress(percent, 'Extracting frames…');
+  if (stage === 'deduplicating') setVideoProgress(percent, 'Skipping near-identical frames…');
+});
+socket?.on('project_updated', ({ classes }) => { project.classes = classes; renderHeader(); });
+socket?.on('job_update', onJobUpdate);
+socket?.on('images_deleted', reloadVisible);
+IA.onReconnect(() => { loadStats(); reloadVisible(); if (current === 'assist' || current === 'export') restoreJobs(); });
+socket?.on('projects_changed', async () => {
+  try { await IA.get(`/api/projects/${PID}`); }
+  catch (e) { if (e.status === 404) { IA.toast('This project was deleted', 'error'); setTimeout(() => { location.href = '/home'; }, 1500); } }
+});
 
-window.setAllImagesPerPage = (perPage) => {
-  allImagesPerPage = perPage;
-  allImagesPage = 1;
-  document.querySelectorAll('#section-all-images .per-page-btn').forEach(btn => {
-    btn.classList.remove('active');
-  });
-  document.getElementById(`all-pp-${perPage}`)?.classList.add('active');
-  loadAllImagesSection();
-};
-
-window.goAllImagesPage = (direction) => {
-  const targetPage = allImagesPage + direction;
-  if (targetPage >= 1 && targetPage <= allImagesTotalPages) {
-    allImagesPage = targetPage;
-    loadAllImagesSection();
-  }
-};
-
-window.toggleAllImagesPreviews = (checked) => {
-  allImagesShowPreviews = checked;
-  localStorage.setItem('ia_show_previews', checked);
-  loadAllImagesSection();
-};
-
-init();
+await loadStats();
+await loadPeople();
+route();
 })();

@@ -1,123 +1,79 @@
-<!DOCTYPE html>
-<html lang="en">
-
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ProCut — Video Editor</title>
-  <meta name="description" content="Lossless Video Cutter via FFmpeg" />
-  <link rel="stylesheet" href="/static/css/main.css" />
-  <link rel="stylesheet" href="/static/css/video_processor.css" />
-</head>
-
-<body>
-  <!-- Topbar -->
-  <header class="topbar">
-    <div class="topbar-brand">
-      <div class="logo-dot" style="background-color: #007acc;"></div>
-      ProCut - Video Editor
+{% extends "base.html" %}
+{% from "_brand.html" import icon %}
+{% block title %}Video tools{% endblock %}
+{% block head %}
+<style>
+  .vp { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: var(--sp-4); align-items: start; }
+  .player { background: #000; border: 1px solid var(--line); border-radius: var(--r-lg); overflow: hidden; }
+  .player video { display: block; width: 100%; max-height: 62vh; background: #000; }
+  .player .empty { min-height: 320px; }
+  .timeline { padding: 12px 14px; border-top: 1px solid var(--line); background: var(--bg-1); }
+  .track { position: relative; height: 34px; border-radius: var(--r-md); background: var(--bg-2); border: 1px solid var(--line-strong); cursor: pointer; }
+  .track .range { position: absolute; top: 0; bottom: 0; background: var(--accent-soft); border-left: 2px solid var(--accent); border-right: 2px solid var(--accent); }
+  .track .head { position: absolute; top: -4px; bottom: -4px; width: 2px; margin-left: -1px; background: var(--fg-0); border-radius: 1px; box-shadow: 0 0 0 3px rgb(0 0 0 / 0.4); }
+  .tl-meta { display: flex; justify-content: space-between; margin-top: 8px; font: var(--fs-xs) var(--font-mono); color: var(--fg-2); }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 12px; }
+  .io { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; font-size: var(--fs-sm); }
+  .io dt { color: var(--fg-2); }
+  .io dd { font-family: var(--font-mono); color: var(--fg-0); text-align: right; }
+  @media (max-width: 1000px) { .vp { grid-template-columns: 1fr; } }
+</style>
+{% endblock %}
+{% block content %}
+<main class="page">
+  <div class="page-head">
+    <div>
+      <div class="eyebrow">Video tools</div>
+      <h1>Cut a clip</h1>
+      <p>Trim a long recording to the part you need, without re-encoding. To turn a video into frames for a project, use <b>Video → frames</b> inside the project.</p>
     </div>
-    <div class="topbar-spacer"></div>
-    <div class="topbar-actions">
-      <button class="btn btn-ghost" onclick="window.close()" title="Close Tab">✖ Close</button>
-    </div>
-  </header>
+  </div>
 
-  <main class="vp-container">
-    <!-- Video Player Section -->
-    <div class="vp-video-section">
-      <video id="video-player" controls preload="metadata">
-        Your browser does not support the video tag.
-      </video>
-    </div>
-
-    <!-- Timeline Layout -->
-    <div class="vp-timeline">
-      <span id="lbl-current-time" class="time-label">00:00:00.00</span>
-      <div class="timeline-wrapper">
-        <div class="timeline-highlight" id="timeline-highlight"></div>
-        <div class="timeline-marker" id="marker-start" style="display: none;"></div>
-        <div class="timeline-marker" id="marker-end" style="display: none;"></div>
-        <input type="range" id="video-slider" min="0" max="100" value="0" step="0.01">
+  <div class="panel" style="margin-bottom: 16px">
+    <div class="panel-body">
+      <div class="input-group">
+        <input class="input" id="path" placeholder="Path to a video on this server, e.g. D:\recordings\cam-01.mp4" spellcheck="false"/>
+        <button class="btn" id="browse">{{ icon('folder-open') }}Browse…</button>
+        <button class="btn btn-primary" id="load">Open</button>
       </div>
-      <span id="lbl-total-time" class="time-label">00:00:00.00</span>
+    </div>
+  </div>
+
+  <div class="vp">
+    <div class="player">
+      <div class="empty" id="player-empty"><div class="empty-art">{{ icon('film') }}</div><h3>No video open</h3><p>Open a file above to preview and trim it.</p></div>
+      <video id="video" class="hidden" preload="metadata"></video>
+      <div class="timeline">
+        <div class="track" id="track"><div class="range" id="range" style="left:0;width:100%"></div><div class="head" id="head" style="left:0"></div></div>
+        <div class="tl-meta"><span id="t-cur">00:00:00.00</span><span id="t-total">00:00:00.00</span></div>
+        <div class="controls">
+          <button class="btn btn-sm" id="play" disabled>{{ icon('play') }}<span>Play</span><span class="kbd">Space</span></button>
+          <button class="btn btn-sm" id="set-in" disabled>Set start<span class="kbd">I</span></button>
+          <button class="btn btn-sm" id="set-out" disabled>Set end<span class="kbd">O</span></button>
+          <button class="btn btn-sm btn-ghost" id="reset-range" disabled>Reset</button>
+          <div class="topbar-spacer"></div>
+          <button class="btn btn-primary btn-sm" id="export" disabled>{{ icon('scissors') }}Export clip…</button>
+        </div>
+      </div>
     </div>
 
-    <!-- Bottom Panel -->
-    <div class="vp-bottom-panel">
-      <!-- Controls Panel -->
-      <fieldset class="vp-group">
-        <legend>Timeline Controls</legend>
-
-        <div class="vp-row">
-          <input type="text" id="import-path" class="form-input" placeholder="Click 'Select Video' to choose..."
-            readonly style="flex:1" />
-          <button id="btn-pick" class="btn btn-secondary" onclick="pickImportFile()">📁 Select Video</button>
-          <button id="btn-import" class="btn btn-primary" onclick="loadVideo()">Import Video</button>
-        </div>
-
-        <div class="vp-row" style="margin-top: 10px;">
-          <button id="btn-play" class="btn btn-secondary" onclick="togglePlay()" disabled>Play / Pause</button>
-          <button id="btn-set-start" class="btn btn-secondary" onclick="setStartTime()" disabled>Set In-Point
-            [Start]</button>
-          <button id="btn-set-end" class="btn btn-secondary" onclick="setEndTime()" disabled>Set Out-Point
-            [End]</button>
-        </div>
-
-        <div class="vp-export-row">
-          <div class="vp-export-labels">
-            <span id="lbl-start-time" class="time-label">Start: --:--:--.--</span>
-            <span id="lbl-end-time" class="time-label">End: --:--:--.--</span>
-          </div>
-          <button id="btn-export" class="btn btn-save" onclick="exportVideo()" disabled>Export Lossless Cut</button>
-        </div>
-      </fieldset>
-
-      <!-- Telemetry Panel -->
-      <fieldset class="vp-group">
-        <legend>Video Telemetry</legend>
-        <table class="vp-stats-table">
-          <thead>
-            <tr>
-              <th style="color: #aaaaaa;">Metric</th>
-              <th style="color: #aaaaaa;">Source Video</th>
-              <th style="color: #aaaaaa;">Exported Cut</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>Frames Per Second:</td>
-              <td id="lbl-src-fps">N/A</td>
-              <td id="lbl-cut-fps">N/A</td>
-            </tr>
-            <tr>
-              <td>Resolution:</td>
-              <td id="lbl-src-res">N/A</td>
-              <td id="lbl-cut-res">N/A</td>
-            </tr>
-            <tr>
-              <td>Video Codec:</td>
-              <td id="lbl-src-codec">N/A</td>
-              <td id="lbl-cut-codec">N/A</td>
-            </tr>
-            <tr>
-              <td>Total Frame Count:</td>
-              <td id="lbl-src-frames">N/A</td>
-              <td id="lbl-cut-frames">N/A</td>
-            </tr>
-            <tr>
-              <td>Avg Size (First 5):</td>
-              <td id="lbl-src-size">N/A</td>
-              <td id="lbl-cut-size">N/A</td>
-            </tr>
-          </tbody>
-        </table>
-      </fieldset>
+    <div class="stack">
+      <div class="panel">
+        <div class="panel-head"><h3>Selection</h3></div>
+        <div class="panel-body"><dl class="io">
+          <dt>Start</dt><dd id="in-lbl">—</dd><dt>End</dt><dd id="out-lbl">—</dd><dt>Length</dt><dd id="len-lbl">—</dd>
+        </dl></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h3>Details</h3><span class="meta">source → clip</span></div>
+        <div class="panel-body"><dl class="io" id="stats">
+          <dt>Resolution</dt><dd data-k="resolution">—</dd><dt>Frame rate</dt><dd data-k="fps">—</dd>
+          <dt>Frames</dt><dd data-k="frames">—</dd><dt>Codec</dt><dd data-k="codec">—</dd><dt>Avg frame</dt><dd data-k="avg_size_kb">—</dd>
+        </dl></div>
+      </div>
+      <div id="result"></div>
     </div>
-  </main>
-
-  <script src="/static/js/api.js"></script>
-  <script src="/static/js/video_processor.js"></script>
-</body>
-
-</html>
+  </div>
+</main>
+{% endblock %}
+{% block scripts %}<script src="{{ asset('js/video_processor.js') }}"></script>{% endblock %}

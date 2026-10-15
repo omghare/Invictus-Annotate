@@ -1,0 +1,8 @@
+# Machines with an NVIDIA GPU (e.g. an RTX 4050 laptop). Needs a recent NVIDIA driver.
+# About 3 GB download / 4.5 GB installed. Use --no-cache-dir so pip doesn't keep a second copy:
+#   pip install --no-cache-dir -r requirements-gpu.txt
+# Training and Model assist switch to the GPU automatically — no setting to change.
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch
+torchvision
+-r requirements.txt

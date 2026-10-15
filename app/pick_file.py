@@ -3,6 +3,8 @@ from tkinter import filedialog
 import sys
 
 def main():
+    # Parent process decodes UTF-8 (paths may contain non-ASCII characters)
+    sys.stdout.reconfigure(encoding="utf-8")
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
 
     root = tk.Tk()

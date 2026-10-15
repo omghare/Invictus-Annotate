@@ -1,169 +1,97 @@
+{% from "_brand.html" import brand_mark, icon, head_common %}
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Invictus Annotate — Login</title>
-  <meta name="description" content="Log in to Invictus Annotate, the LAN-based YOLO annotation tool."/>
-  <link rel="stylesheet" href="/static/css/main.css"/>
+  {{ head_common() }}
+  <title>Sign in · Invictus Annotate</title>
   <style>
-    body { display:flex; align-items:center; justify-content:center; min-height:100vh; }
-
-    /* Animated background grid */
-    body::before {
-      content:'';
-      position:fixed; inset:0;
-      background-image:
-        linear-gradient(rgba(124,109,255,0.03) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(124,109,255,0.03) 1px, transparent 1px);
-      background-size: 40px 40px;
-      pointer-events:none;
-    }
-
-    .login-wrap {
-      width:100%; max-width:380px;
-      padding:20px;
-      animation: fade-in 400ms ease;
-    }
-
-    .login-logo {
-      text-align:center; margin-bottom:32px;
-    }
-    .login-logo .logo-mark {
-      width:56px; height:56px;
-      background: linear-gradient(135deg, var(--accent), var(--accent-light));
-      border-radius:16px;
-      display:inline-flex; align-items:center; justify-content:center;
-      font-size:24px; margin-bottom:12px;
-      box-shadow: 0 8px 32px var(--accent-glow);
-    }
-    .login-logo h1 { font-size:1.4rem; margin-bottom:4px; }
-    .login-logo p  { color:var(--text-secondary); font-size:13px; }
-
-    .login-card {
-      background:var(--bg-surface);
-      border:1px solid var(--border);
-      border-radius:var(--radius-xl);
-      padding:28px;
-      box-shadow:var(--shadow-lg);
-    }
-
-    .login-card .form-group + .form-group { margin-top:16px; }
-
-    .login-btn {
-      width:100%; margin-top:24px;
-      padding:11px; font-size:15px;
-      border-radius:var(--radius-lg);
-      border:none; cursor:pointer;
-      background:linear-gradient(135deg, var(--accent), var(--accent-light));
-      color:#fff; font-weight:600;
-      letter-spacing:0.01em;
-      transition:all var(--t-base);
-      display:flex; align-items:center; justify-content:center; gap:8px;
-    }
-    .login-btn:hover { transform:translateY(-1px); box-shadow:var(--shadow-accent); }
-    .login-btn:active{ transform:translateY(0); }
-    .login-btn:disabled { opacity:0.5; pointer-events:none; }
-
-    .login-error {
-      background:var(--red-d);
-      border:1px solid rgba(255,95,126,0.3);
-      color:var(--red);
-      border-radius:var(--radius);
-      padding:10px 14px;
-      font-size:13px;
-      margin-top:14px;
-      display:none;
-    }
+    body { display: grid; place-items: center; min-height: 100vh; padding: 24px; }
+    .auth { width: min(360px, 100%); }
+    .auth-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 28px; font-weight: 600; font-size: var(--fs-md); }
+    .auth-brand .brand-mark { width: 28px; height: 28px; }
+    .auth-brand small { color: var(--fg-2); font-weight: 500; }
+    .auth h1 { font-size: var(--fs-xl); margin-bottom: 4px; }
+    .auth .lead { color: var(--fg-2); font-size: var(--fs-base); margin-bottom: 24px; }
+    .auth form { display: flex; flex-direction: column; gap: 14px; }
+    .auth .btn-lg { margin-top: 6px; }
+    .auth .foot { margin-top: 28px; font-size: var(--fs-xs); color: var(--fg-3); display: flex; justify-content: space-between; }
+    .caps { font-size: var(--fs-xs); color: var(--warning); display: none; }
+    .caps.on { display: block; }
+    #form-error:empty { display: none; }
   </style>
 </head>
 <body>
-  <div class="login-wrap">
-    <div class="login-logo">
-      <div class="logo-mark">🎯</div>
-      <h1>Invictus Annotate</h1>
-      <p>LAN Bounding Box Annotation Tool</p>
-    </div>
+  <main class="auth rise">
+    <div class="auth-brand">{{ brand_mark() }}<span>Invictus <small>Annotate</small></span></div>
+    <h1>Sign in</h1>
+    <p class="lead">Use the account your admin created for you.</p>
 
-    <div class="login-card">
-      <div class="form-group">
-        <label class="form-label" for="username">Username</label>
-        <input class="form-input" id="username" type="text"
-               placeholder="Enter username" autocomplete="username" autofocus/>
+    <form id="login-form" novalidate>
+      <div class="field">
+        <label for="username">Username</label>
+        <input class="input" id="username" name="username" autocomplete="username" autocapitalize="off" spellcheck="false" autofocus required/>
       </div>
-      <div class="form-group">
-        <label class="form-label" for="password">Password</label>
-        <input class="form-input" id="password" type="password"
-               placeholder="Enter password" autocomplete="current-password"/>
+      <div class="field">
+        <label for="password">Password</label>
+        <input class="input" id="password" name="password" type="password" autocomplete="current-password" required/>
+        <span class="caps" id="caps">Caps Lock is on</span>
       </div>
+      <div class="callout danger" id="form-error" role="alert"></div>
+      <button class="btn btn-primary btn-lg" type="submit" id="submit">Sign in</button>
+    </form>
 
-      <div class="login-error" id="login-error"></div>
+    <div class="foot"><span>LAN workspace</span><span id="reason"></span></div>
+  </main>
 
-      <button class="login-btn" id="login-btn">
-        <span id="btn-text">Sign In</span>
-        <span id="btn-spinner" class="spinner hidden" style="width:16px;height:16px;border-width:2px;"></span>
-      </button>
-    </div>
-  </div>
-
-  <div id="toast-container"></div>
-
+  <div id="toasts"></div>
+  <script src="{{ asset('js/core.js') }}"></script>
   <script>
-    // Redirect if already logged in
-    const token = localStorage.getItem('ia_token');
-    if (token) {
-      const payload = JSON.parse(atob(token.split('.')[1]));
-      if (payload.exp * 1000 > Date.now()) {
-        window.location.href = payload.is_admin ? '/dashboard' : '/project';
-      }
-    }
+  (() => {
+    const params = new URLSearchParams(location.search);
+    const reason = params.get('reason');
+    if (reason === 'expired') document.getElementById('reason').textContent = 'Your session expired — sign in again.';
 
-    const form   = document.getElementById('login-btn');
-    const errEl  = document.getElementById('login-error');
-    const spinner= document.getElementById('btn-spinner');
-    const btnTxt = document.getElementById('btn-text');
+    // Already signed in with a valid token? Skip the form.
+    const t = IA.getToken(), u = IA.getUser(), p = t && IA.decodeJwt(t);
+    if (u && p && p.exp * 1000 > Date.now() && !reason) { location.replace(destination(u)); return; }
 
-    async function doLogin() {
-      const username = document.getElementById('username').value.trim();
-      const password = document.getElementById('password').value;
-      if (!username || !password) { showError('Please enter username and password.'); return; }
-
-      form.disabled = true;
-      spinner.classList.remove('hidden');
-      btnTxt.textContent = 'Signing in…';
-      errEl.style.display = 'none';
-
+    function destination(user) {
+      if (user.must_change_password) return '/account?first=1';
+      // Only same-origin paths: "/\evil.com" or "/	/evil.com" would otherwise leave the site
       try {
-        const res = await fetch('/api/auth/login', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ username, password }),
-        });
-        const data = await res.json();
-        if (!res.ok) { showError(data.detail || 'Login failed'); return; }
-
-        localStorage.setItem('ia_token', data.access_token);
-        localStorage.setItem('ia_user',  JSON.stringify({
-          id: data.user_id, username: data.username, is_admin: data.is_admin,
-        }));
-
-        window.location.href = data.is_admin ? '/dashboard' : '/project';
-      } catch (e) {
-        showError('Network error — is the server running?');
-      } finally {
-        form.disabled = false;
-        spinner.classList.add('hidden');
-        btnTxt.textContent = 'Sign In';
-      }
+        const next = new URL(params.get('next') || '/home', location.origin);
+        if (next.origin === location.origin && !next.pathname.startsWith('/login')) return next.pathname + next.search + next.hash;
+      } catch { /* malformed → home */ }
+      return '/home';
     }
 
-    function showError(msg) {
-      errEl.textContent = msg;
-      errEl.style.display = 'block';
-    }
+    const form = document.getElementById('login-form');
+    const err = document.getElementById('form-error');
+    const pw = document.getElementById('password');
+    pw.addEventListener('keyup', (e) => document.getElementById('caps').classList.toggle('on', e.getModifierState?.('CapsLock')));
 
-    form.addEventListener('click', doLogin);
-    document.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      err.textContent = '';
+      const username = form.username.value.trim();
+      const password = pw.value;
+      if (!username || !password) { err.textContent = 'Enter your username and password.'; return; }
+      await IA.busy(document.getElementById('submit'), async () => {
+        try {
+          const res = await fetch('/api/auth/login', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) { err.textContent = IA.formatError(data); pw.select(); return; }
+          IA.setSession(data);
+          location.href = destination(IA.getUser());
+        } catch {
+          err.textContent = 'Cannot reach the server — check the connection.';
+        }
+      });
+    });
+  })();
   </script>
 </body>
 </html>

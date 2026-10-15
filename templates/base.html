@@ -1,0 +1,62 @@
+{% from "_brand.html" import brand_mark, icon, head_common %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  {{ head_common() }}
+  <title>{% block title %}Invictus Annotate{% endblock %} · Invictus Annotate</title>
+  {% block head %}{% endblock %}
+</head>
+<body class="{% block body_class %}{% endblock %}">
+<div class="shell">
+  <aside class="rail" id="rail">
+    <a class="brand" href="/home">{{ brand_mark() }}<span>Invictus</span><small>Annotate</small></a>
+
+    <nav class="rail-scroll" aria-label="Main">
+      <a class="nav-link" data-nav="projects" href="/home">{{ icon('folder') }}Projects</a>
+      <a class="nav-link" data-nav="video" data-admin href="/video_processor">{{ icon('scissors') }}Video tools</a>
+      <a class="nav-link" data-nav="train" data-admin href="/train">{{ icon('cpu') }}Train model</a>
+      <a class="nav-link" data-nav="users" data-admin href="/users">{{ icon('users') }}Users</a>
+      <a class="nav-link" data-nav="system" data-admin href="/system">{{ icon('monitor') }}System</a>
+
+      {% if project_id %}
+      <div class="rail-label">Project <span class="rail-project" id="rail-project-name"></span></div>
+      <a class="nav-link" data-nav="overview" data-admin href="/projects/{{ project_id }}#overview">{{ icon('layout-dashboard') }}Overview</a>
+      <a class="nav-link" data-nav="images" data-admin href="/projects/{{ project_id }}#images">{{ icon('images') }}All images<span class="nav-count" data-count="total"></span></a>
+      <a class="nav-link" data-nav="video-frames" data-admin href="/projects/{{ project_id }}#video">{{ icon('film') }}Video → frames</a>
+      <a class="nav-link" data-nav="import" data-admin href="/projects/{{ project_id }}#import">{{ icon('folder-open') }}Import images</a>
+      <a class="nav-link" data-nav="assign" data-admin href="/projects/{{ project_id }}#assign">{{ icon('user-plus') }}Assign<span class="nav-count" data-count="unassigned"></span></a>
+      <a class="nav-link" data-nav="review" data-admin href="/projects/{{ project_id }}#review">{{ icon('check-check') }}Review<span class="nav-count" data-count="ready"></span></a>
+      <a class="nav-link" data-nav="assist" data-admin href="/projects/{{ project_id }}#assist">{{ icon('sparkle') }}Model assist</a>
+      <a class="nav-link" data-nav="classes" data-admin href="/projects/{{ project_id }}#classes">{{ icon('tag') }}Classes</a>
+      <a class="nav-link" data-nav="export" data-admin href="/projects/{{ project_id }}#export">{{ icon('package') }}Export &amp; cloud training</a>
+      <a class="nav-link" data-nav="mine" href="/projects/{{ project_id }}/view">{{ icon('pencil') }}My images<span class="nav-count" data-count="mine"></span></a>
+      {% endif %}
+    </nav>
+
+    <div class="rail-foot">
+      <button class="user-chip" id="user-chip" aria-haspopup="menu">
+        <span data-avatar></span>
+        <span class="who"><b></b><span></span></span>
+        {{ icon('ellipsis', 'i-sm') }}
+      </button>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="btn btn-ghost btn-icon rail-toggle" aria-label="Menu">{{ icon('panel-left') }}</button>
+      <nav class="crumbs" id="crumbs" aria-label="Breadcrumb"></nav>
+      <div class="topbar-spacer"></div>
+      {% block topbar_actions %}{% endblock %}
+      <span class="conn"><span class="conn-dot"></span><span class="conn-label">Connecting</span></span>
+    </header>
+    {% block content %}{% endblock %}
+  </div>
+</div>
+
+<div id="toasts"></div>
+<script src="/static/js/vendor/socket.io.min.js"></script>
+<script src="{{ asset('js/core.js') }}"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

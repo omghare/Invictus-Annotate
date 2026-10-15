@@ -8,36 +8,46 @@ Endpoints:
   POST /api/train/validate-dataset — Validate a dataset folder path
   POST /api/train/start            — Start training session
   POST /api/train/stop             — Stop running training session
-  GET  /api/train/status           — Current session state (for reconnect)
+  GET  /api/train/status           — Current session state + history (for reload/reconnect)
   GET  /api/train/models           — List saved .pt files in models/
-  GET  /api/train/models/{name}    — Download a specific .pt file
+  GET  /api/train/models/{name}    — Download a specific .pt file (media cookie or Bearer)
+  GET  /api/train/runs             — Every run (local and imported cloud runs) with metrics
+  POST /api/train/runs/{id}/resume — Continue a stopped / interrupted run from last.pt
+  DELETE /api/train/runs/{id}      — Delete a run and its weights
 
-Training runs in a subprocess (sys.executable → train_worker.py).
-Output is streamed line-by-line and forwarded over Socket.IO.
+Training runs in a subprocess (sys.executable → train_worker.py). Its stdout is read in
+chunks (the progress bar writes '\\r' without newlines) and forwarded over Socket.IO.
+torch is never imported in this web process, so the server holds no CUDA context.
+
+The worker gets a cleaned copy of data.yaml with absolute paths (no `download:` key) and
+may only load known base weights or .pt files inside models/ / training_runs/ (a .pt file
+is a pickle — loading one runs code). Finished weights are hard-linked into models/<run>/
+so a run costs its disk space once.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-import platform
 import re
 import shutil
 import subprocess
 import sys
 import time
 import uuid
+from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import psutil
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from app.auth import get_admin_user
-from app.config import BASE_DIR, MODELS_DIR, TRAINING_RUNS_DIR
+from app.auth import get_admin_header_or_query, get_admin_user
+from app.config import DATA_DIR, MODEL_CACHE_DIR, MODELS_DIR, TRAINING_RUNS_DIR
+from app.database import connect, new_id, now_iso
 from app.socket_manager import (
     emit_train_comment,
     emit_train_complete,
@@ -53,7 +63,9 @@ router = APIRouter(tags=["trainer"])
 WORKER_SCRIPT = Path(__file__).parent / "train_worker.py"
 
 # ── Image extensions recognised as training data ───────────────────────────────
-_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+TERMINAL_STATES = {"idle", "complete", "error", "stopped"}
 
 
 # ── In-memory training session ────────────────────────────────────────────────
@@ -63,20 +75,25 @@ class _Session:
         self.session_id: Optional[str] = None
         self.process: Optional[asyncio.subprocess.Process] = None
         self.start_time: Optional[float] = None
+        self.end_time: Optional[float] = None
         self.config: Optional[dict] = None
-        self.status: str = "idle"      # idle | running | stopping | complete | error
+        self.status: str = "idle"      # idle | running | stopping | complete | error | stopped
         self.epoch: int = 0
         self.total_epochs: int = 0
         self.epoch_history: list = []
+        self.log_tail: deque = deque(maxlen=500)
         self.final_result: Optional[dict] = None
+        self.error: Optional[str] = None
+        self.stop_file: Optional[Path] = None
+        self.run_id: Optional[str] = None
+        self.run_name: Optional[str] = None
         self._stream_task: Optional[asyncio.Task] = None
         self._monitor_task: Optional[asyncio.Task] = None
-
-    def reset(self):
-        self.__init__()
+        self._stop_task: Optional[asyncio.Task] = None
 
 
 _session = _Session()
+_session_lock = asyncio.Lock()
 
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
@@ -85,24 +102,24 @@ class ValidateDatasetRequest(BaseModel):
     path: str
 
 class StartTrainingRequest(BaseModel):
-    dataset_path: str
+    dataset_path: str = ""
     yaml_path: str
-    model: str                        # e.g. "yolov8n.pt" or "yolo11m.pt"
+    model: str                        # base weights ("yolo11n.pt") or a .pt inside models/
     dataset_name: str                 # used for naming the output .pt
     run_name_override: Optional[str] = None  # optional custom run name from user
-    epochs: int = 100
-    batch: int = 16
-    imgsz: int = 640
-    patience: int = 50
-    lr0: float = 0.01
-    optimizer: str = "SGD"
-    workers: int = 2                  # default matching CPU physical core count
-    device: str = "cpu"               # default CPU for non-GPU hardware
+    epochs: int = Field(100, ge=1, le=3000)
+    batch: int = Field(16, ge=-1, le=512)         # -1 = AutoBatch (GPU)
+    imgsz: int = Field(640, ge=32, le=4096)
+    patience: int = Field(50, ge=0, le=3000)
+    lr0: float = Field(0.01, gt=0, le=1)
+    optimizer: Literal["SGD", "Adam", "AdamW", "NAdam", "RAdam", "RMSProp", "auto"] = "SGD"
+    workers: int = Field(2, ge=0, le=32)
+    device: str = Field("auto", max_length=32)    # auto = first GPU when CUDA works, else cpu
     cos_lr: bool = False
-    warmup_epochs: float = 3.0
-    weight_decay: float = 0.0005
-    mosaic: float = 1.0
-    memory_budget_gb: Optional[float] = None  # user-selected memory budget
+    warmup_epochs: float = Field(3.0, ge=0, le=50)
+    weight_decay: float = Field(0.0005, ge=0, le=0.1)
+    mosaic: float = Field(1.0, ge=0, le=1)
+    memory_budget_gb: Optional[float] = Field(None, gt=0, le=1024)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -125,12 +142,16 @@ def _find_yaml(folder: Path) -> Optional[Path]:
     return None
 
 
-def _folder_size_mb(folder: Path) -> float:
-    """Recursively compute folder size in MB."""
+def _folder_size_mb(folder: Path, max_files: int = 200_000) -> float:
+    """Recursively compute folder size in MB (stops after max_files so a drive root can't hang it)."""
     total = 0
+    seen = 0
     try:
         for f in folder.rglob("*"):
             if f.is_file():
+                seen += 1
+                if seen > max_files:
+                    break
                 try:
                     total += f.stat().st_size
                 except OSError:
@@ -198,6 +219,7 @@ def _recommend_params(dataset: dict, sysinfo: dict) -> dict:
     ram_avail = dataset.get("ram_available_gb", 8) or 8
     cpu_phy = dataset.get("cpu_count_physical", 2) or 2
     budget  = dataset.get("memory_budget_gb")  # may be None
+    chosen  = dataset.get("model")             # the model the user picked (batch is sized for it)
 
     # Effective memory: if GPU, use VRAM; else RAM
     eff_mem = vram if cuda else ram_avail
@@ -235,8 +257,8 @@ def _recommend_params(dataset: dict, sysinfo: dict) -> dict:
     if cuda:
         # GPU batch estimation based on effective memory and model size
         model_mem_factor = {"n": 0.15, "s": 0.25, "m": 0.45, "l": 0.70, "x": 1.1}
-        variant = model[-4]  # e.g. 'n', 's', 'm'
-        mfac = model_mem_factor.get(variant, 0.3)
+        m = re.search(r"([nsmlx])(?:-\w+)?\.pt$", chosen or model)
+        mfac = model_mem_factor.get(m.group(1) if m else "", 0.3)
         safe_batch = max(1, int((eff_mem - mfac) / 0.25))
         batch = min(64, max(4, (safe_batch // 4) * 4))  # round to multiple of 4
         batch_reason = f"Estimated from {eff_mem:.1f} GB VRAM budget."
@@ -339,17 +361,15 @@ def _recommend_params(dataset: dict, sysinfo: dict) -> dict:
     }
 
 
+
 def _run_sync(cmd: list[str], timeout: int = 5) -> tuple[int, str, str]:
     """Run a command synchronously with no window (Windows safe)."""
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     try:
         r = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
-            creationflags=flags,
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, creationflags=flags,
         )
         return r.returncode, r.stdout, r.stderr
     except FileNotFoundError:
@@ -358,29 +378,89 @@ def _run_sync(cmd: list[str], timeout: int = 5) -> tuple[int, str, str]:
         return 1, "", f"Command timed out after {timeout}s"
 
 
-def _get_gpu_stats_nvidia_smi() -> dict:
-    """Fallback GPU stats via nvidia-smi --query-gpu."""
-    rc, out, _ = _run_sync([
-        "nvidia-smi",
-        "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu",
-        "--format=csv,noheader,nounits",
-    ], timeout=4)
-    result = {"gpu_util": 0, "vram_used_mb": 0, "vram_total_mb": 0,
-              "vram_percent": 0.0, "gpu_temp": 0}
-    if rc == 0:
-        parts = [p.strip() for p in out.strip().split(",")]
+def _kill_tree(pid: int) -> None:
+    """Kill a process and all its children (DataLoader workers)."""
+    try:
+        parent = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return
+    for child in parent.children(recursive=True):
         try:
-            result["gpu_util"]     = int(parts[0])
-            result["vram_used_mb"] = int(parts[1])
-            result["vram_total_mb"]= int(parts[2])
-            result["gpu_temp"]     = int(parts[3])
-            if result["vram_total_mb"] > 0:
-                result["vram_percent"] = round(
-                    result["vram_used_mb"] / result["vram_total_mb"] * 100, 1
-                )
-        except (IndexError, ValueError):
+            child.kill()
+        except psutil.NoSuchProcess:
             pass
-    return result
+    try:
+        parent.kill()
+    except psutil.NoSuchProcess:
+        pass
+
+
+# ── GPU via NVML (no torch / CUDA context in the web process) ─────────────────
+
+_nvml: dict[str, Any] = {"ok": None}
+
+
+def _nvml_handle():
+    if _nvml["ok"] is None:
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            _nvml.update(ok=True, mod=pynvml, handle=pynvml.nvmlDeviceGetHandleByIndex(0))
+        except Exception:
+            _nvml["ok"] = False
+    return (_nvml["mod"], _nvml["handle"]) if _nvml["ok"] else (None, None)
+
+
+def _gpu_static_info() -> dict:
+    nv, h = _nvml_handle()
+    if not nv:
+        return {}
+    info: dict[str, Any] = {}
+    try:
+        name = nv.nvmlDeviceGetName(h)
+        info["gpu_name"] = name.decode() if isinstance(name, bytes) else name
+        info["vram_total_mb"] = nv.nvmlDeviceGetMemoryInfo(h).total // (1024 ** 2)
+        drv = nv.nvmlSystemGetDriverVersion()
+        info["driver_version"] = drv.decode() if isinstance(drv, bytes) else drv
+        cuda = nv.nvmlSystemGetCudaDriverVersion()
+        info["cuda_driver_version"] = f"{cuda // 1000}.{(cuda % 1000) // 10}"
+    except Exception:
+        pass
+    return info
+
+
+_PROBE = (
+    "import json\n"
+    "out = {}\n"
+    "try:\n"
+    "    import torch\n"
+    "    out['torch_version'] = torch.__version__\n"
+    "    out['cuda_available'] = bool(torch.cuda.is_available())\n"
+    "    out['cuda_version'] = torch.version.cuda or 'N/A'\n"
+    "except Exception:\n"
+    "    out['torch_version'] = None\n"
+    "try:\n"
+    "    import ultralytics\n"
+    "    out['ultralytics_version'] = ultralytics.__version__\n"
+    "except Exception:\n"
+    "    out['ultralytics_version'] = None\n"
+    "print(json.dumps(out))\n"
+)
+_runtime_cache: dict[str, Any] = {}
+
+
+def _runtime_info() -> dict:
+    """torch / CUDA / ultralytics versions, probed once in a throwaway subprocess."""
+    if not _runtime_cache:
+        rc, out, _ = _run_sync([sys.executable, "-c", _PROBE], timeout=90)
+        try:
+            info = json.loads(out.strip().splitlines()[-1]) if rc == 0 else {}
+        except (ValueError, IndexError):
+            info = {}
+        if info.get("torch_version"):          # a timed-out probe is retried next time, not cached
+            _runtime_cache.update(info)
+        return {"torch_version": None, **info}
+    return dict(_runtime_cache)
 
 
 # ── Performance commentary (rule-based, every 5 epochs) ──────────────────────
@@ -392,7 +472,6 @@ def _generate_commentary(history: list) -> Optional[str]:
     recent = history[-5:]
     comments: list[str] = []
 
-    # mAP50 trend
     maps = []
     for e in recent:
         m = e.get("metrics", {})
@@ -403,233 +482,262 @@ def _generate_commentary(history: list) -> Optional[str]:
     if len(maps) >= 3:
         trend = maps[-1] - maps[0]
         if trend > 0.02:
-            comments.append(f"📈 mAP50 up +{trend:.3f} — excellent momentum!")
+            comments.append(f"mAP50 up +{trend:.3f} over the last 5 epochs.")
         elif trend < -0.015:
-            comments.append("📉 mAP50 dropped recently — possible overfitting, watch val loss.")
+            comments.append("mAP50 dropped recently — possible overfitting; watch validation loss.")
         elif maps[-1] >= 0.75:
-            comments.append(f"✅ mAP50 stable at {maps[-1]:.3f} — strong convergence.")
+            comments.append(f"mAP50 stable at {maps[-1]:.3f} — converging well.")
         else:
-            comments.append(f"⟳ mAP50 plateaued at {maps[-1]:.3f}. More epochs or LR tuning may help.")
+            comments.append(f"mAP50 flat at {maps[-1]:.3f}. More epochs or LR tuning may help.")
 
-    # Box loss trend
     box_losses = []
     for e in recent:
         items = e.get("loss_items", [])
-        if items:
-            try:
-                box_losses.append(float(items[0]))
-            except (TypeError, ValueError):
-                pass
+        if items and items[0] is not None:
+            box_losses.append(float(items[0]))
 
     if len(box_losses) >= 3:
         loss_trend = box_losses[-1] - box_losses[0]
         if loss_trend < -0.05:
-            comments.append("✅ Box loss still declining — model actively learning.")
+            comments.append("Box loss still falling — the model is learning.")
         elif loss_trend > 0.05:
-            comments.append("⚠️ Box loss increased — possible gradient instability.")
+            comments.append("Box loss increased — possible instability; consider a lower LR.")
         else:
-            comments.append(f"ℹ️ Box loss stabilising at {box_losses[-1]:.4f}.")
+            comments.append(f"Box loss levelling off at {box_losses[-1]:.4f}.")
 
     if not comments:
-        return "Training progressing normally — keep monitoring."
+        return "Training progressing normally."
     return "  ".join(comments)
 
 
 # ── Training stream reader ────────────────────────────────────────────────────
 
-async def _stream_training():
-    """Read subprocess stdout line-by-line; emit log/epoch/complete events."""
-    global _session
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
-    proc = _session.process
-    if not proc:
+
+async def _log(session: _Session, line: str) -> None:
+    session.log_tail.append(line)
+    await emit_train_log(line)
+
+
+async def _dispatch_line(session: _Session, line: str) -> None:
+    line = _ANSI.sub("", line).rstrip()
+    if not line:
         return
+    if line.startswith('{"__event__"'):
+        try:
+            event = json.loads(line)
+            etype = event.pop("__event__", "")
+            try:
+                await _handle_worker_event(session, etype, event)
+            except Exception as exc:          # one bad event must never stop the reader
+                await _log(session, f"[WARN] Could not handle '{etype}' event: {exc}")
+            return
+        except json.JSONDecodeError:
+            pass
+    await _log(session, line)
 
+
+async def _stream_training(session: _Session):
+    """
+    Drain the worker's stdout in chunks. Newline-terminated lines are forwarded as log
+    lines; carriage-return progress-bar redraws are coalesced to one line every 2 s.
+    Reading never stops early, so the worker can never block on a full pipe.
+    """
+    import codecs
+    proc = session.process
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    buf = ""
+    last_progress = 0.0
     try:
         while True:
-            raw = await proc.stdout.readline()
-            if not raw:
+            chunk = await proc.stdout.read(65536)
+            if not chunk:
                 break
-
-            line = raw.decode("utf-8", errors="replace").rstrip("\n\r")
-
-            # Check for structured JSON event
-            if line.startswith('{"__event__"'):
-                try:
-                    event = json.loads(line)
-                    etype = event.pop("__event__", "")
-                    await _handle_worker_event(etype, event)
-                    continue
-                except json.JSONDecodeError:
-                    pass  # fall through to log line
-
-            # Raw log line — forward to training room
-            await emit_train_log(line)
-
+            buf += decoder.decode(chunk)
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                segments = [s for s in line.split("\r") if s.strip()]
+                if segments:
+                    await _dispatch_line(session, segments[-1])
+            if "\r" in buf:
+                segments = buf.split("\r")
+                buf = segments[-1]
+                latest = next((s for s in reversed(segments[:-1]) if s.strip()), None)
+                if latest and time.monotonic() - last_progress > 2:
+                    last_progress = time.monotonic()
+                    await _dispatch_line(session, latest)
+            if len(buf) > 262144:
+                buf = buf[-65536:]
+        if buf.strip():
+            await _dispatch_line(session, buf.split("\r")[-1])
     except asyncio.CancelledError:
         pass
     except Exception as exc:
-        await emit_train_error(f"Stream reader error: {exc}")
+        await _log(session, f"[WARN] Log reader error: {exc}")
 
-    # Process finished
-    await proc.wait()
-    if _session.status == "running":
-        if proc.returncode == 0:
-            _session.status = "complete"
+    rc = await proc.wait()
+    session.end_time = time.time()
+    if session.status == "running":
+        if rc == 0:
+            session.status = "complete"
         else:
-            _session.status = "error"
-            await emit_train_error("Training process exited unexpectedly.")
-        await emit_train_status({
-            "status": _session.status,
-            "epoch": _session.epoch,
-            "total_epochs": _session.total_epochs,
-        })
+            session.status = "error"
+            session.error = session.error or "Training process exited unexpectedly."
+            await emit_train_error(session.error)
+    elif session.status == "stopping":
+        session.status = "stopped"
+    if session._monitor_task and not session._monitor_task.done():
+        session._monitor_task.cancel()
+    if session.stop_file:
+        session.stop_file.unlink(missing_ok=True)
+    await _finalise_run(session)
+    await emit_train_status(_status_payload(session, brief=True))
 
 
-async def _handle_worker_event(etype: str, data: dict):
+async def _finalise_run(session: _Session) -> None:
+    """Link the run's weights into models/<run>/ and record how it ended."""
+    weights = TRAINING_RUNS_DIR / (session.run_name or "") / "weights"
+    dest = MODELS_DIR / (session.run_name or "")
+    if session.run_name:
+        for f in ("best.pt", "last.pt"):
+            await asyncio.to_thread(link_or_copy, weights / f, dest / f)
+    await _update_run(session, status=session.status, finished_at=now_iso(), error=session.error)
+
+
+def _final_metrics(session: _Session) -> dict:
+    if session.final_result and session.final_result.get("final_metrics"):
+        return session.final_result["final_metrics"]
+    if session.epoch_history:
+        return session.epoch_history[-1].get("metrics", {})
+    return {}
+
+
+async def _update_run(session: _Session, **fields) -> None:
+    if not session.run_id:
+        return
+    fields.setdefault("epochs_done", session.epoch)
+    fields["metrics"] = json.dumps(_final_metrics(session))
+    if session.epoch_history:
+        fields["best_epoch"] = session.epoch_history[-1].get("best_epoch")
+    sets = ", ".join(f"{k} = ?" for k in fields)
+    async with connect() as db:
+        await db.execute(f"UPDATE training_runs SET {sets} WHERE id = ?", (*fields.values(), session.run_id))
+        await db.commit()
+
+
+async def _handle_worker_event(session: _Session, etype: str, data: dict):
     """Dispatch a structured event from the worker subprocess."""
-    global _session
+    cfg = session.config or {}
+    dest_dir = MODELS_DIR / cfg.get("name", "dataset_run")
+    weights = TRAINING_RUNS_DIR / cfg.get("name", "dataset_run") / "weights"
 
     if etype == "started":
-        await emit_train_log(f"[INFO] Training started — model: {data.get('model')}")
+        await _log(session, f"[INFO] Training started — model: {data.get('model')}")
+
+    elif etype == "log":
+        await _log(session, data.get("line", ""))
 
     elif etype == "epoch":
-        _session.epoch = data["epoch"]
-        _session.total_epochs = data["epochs"]
-        _session.epoch_history.append(data)
-
-        # Continuously backup best.pt and last.pt to MODELS_DIR
-        cfg = _session.config or {}
-        if "name" in cfg:
-            dest_dir = MODELS_DIR / cfg["name"]
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            for key in ("best_pt", "last_pt"):
-                src = data.get(key)
-                if src and Path(src).exists():
-                    try:
-                        shutil.copy2(src, dest_dir / f"{key.replace('_', '.')}")
-                    except Exception:
-                        pass
+        session.epoch = data["epoch"]
+        session.total_epochs = data["epochs"]
+        session.epoch_history.append(data)
+        # Weights stay in training_runs/<run>/weights until the run ends (then linked into models/)
+        await _update_run(session)
 
         await emit_train_epoch(data)
-        await emit_train_status({
-            "status": "running",
-            "epoch": _session.epoch,
-            "total_epochs": _session.total_epochs,
-        })
-
-        # Commentary every 5 epochs
-        if _session.epoch % 5 == 0:
-            comment = _generate_commentary(_session.epoch_history)
+        await emit_train_status(_status_payload(session, brief=True))
+        if session.epoch % 5 == 0:
+            comment = _generate_commentary(session.epoch_history)
             if comment:
-                await emit_train_comment(comment, _session.epoch)
+                await emit_train_comment(comment, session.epoch)
 
     elif etype == "complete":
-        _session.status = "complete"
-        _session.final_result = data
-
-        # Copy best.pt and last.pt to models/<run_name>/
-        saved_path = None
-        cfg = _session.config or {}
-        dest_dir = MODELS_DIR / cfg.get("name", "dataset_run")
-        dest_dir.mkdir(parents=True, exist_ok=True)
-
-        best_pt_src = data.get("best_pt")
-        if best_pt_src and Path(best_pt_src).exists():
-            dest_path = dest_dir / "best.pt"
-            try:
-                shutil.copy2(best_pt_src, dest_path)
-                saved_path = str(dest_path)
-                await emit_train_log(f"[INFO] Best weights saved → {dest_path}")
-            except Exception as exc:
-                await emit_train_log(f"[WARN] Could not copy best.pt: {exc}")
-
-        last_pt_src = data.get("last_pt")
-        if last_pt_src and Path(last_pt_src).exists():
-            try:
-                shutil.copy2(last_pt_src, dest_dir / "last.pt")
-            except Exception as exc:
-                await emit_train_log(f"[WARN] Could not copy last.pt: {exc}")
-
-        await emit_train_complete({**data, "saved_model_path": saved_path})
-        await emit_train_status({"status": "complete", "saved_model_path": saved_path})
+        saved_rel = None
+        if await asyncio.to_thread(link_or_copy, weights / "best.pt", dest_dir / "best.pt"):
+            saved_rel = (dest_dir / "best.pt").relative_to(MODELS_DIR).as_posix()
+            await _log(session, f"[INFO] Best weights saved → {dest_dir / 'best.pt'}")
+        await asyncio.to_thread(link_or_copy, weights / "last.pt", dest_dir / "last.pt")
+        session.status = "complete"
+        session.final_result = {**data, "saved_model_path": str(dest_dir / "best.pt") if saved_rel else None,
+                                "saved_model_rel": saved_rel}
+        await emit_train_complete(session.final_result)
+        await emit_train_status(_status_payload(session, brief=True))
 
     elif etype == "stopped":
-        _session.status = "stopped"
-        await emit_train_log(f"[INFO] {data.get('message', 'Training stopped.')}")
-        await emit_train_status({"status": "stopped"})
+        session.status = "stopped"
+        await _log(session, f"[INFO] {data.get('message', 'Training stopped.')}")
+        await emit_train_status(_status_payload(session, brief=True))
 
     elif etype == "error":
-        _session.status = "error"
-        await emit_train_error(data.get("message", "Unknown error"))
-        await emit_train_status({"status": "error", "message": data.get("message", "")})
+        session.status = "error"
+        session.error = _ANSI.sub("", data.get("message", "Unknown error")).strip()
+        await emit_train_error(session.error)
+        await emit_train_status(_status_payload(session, brief=True))
 
 
-async def _hardware_monitor():
+async def _hardware_monitor(session: _Session):
     """Push hardware stats to training room every 2 s during active training."""
-    while _session.status == "running":
+    while session.status in ("running", "stopping"):
         try:
-            stats = _build_hardware_stats()
-            await emit_train_hardware(stats)
+            await emit_train_hardware(await asyncio.to_thread(_build_hardware_stats))
         except Exception:
             pass
         await asyncio.sleep(2)
 
 
 def _build_hardware_stats() -> dict:
-    """Collect CPU/RAM/GPU/VRAM stats. Bypasses GPU polling if CUDA is unavailable."""
-    cpu_pct  = psutil.cpu_percent(interval=None)
-    mem      = psutil.virtual_memory()
-    ram_pct  = mem.percent
-    ram_used = round(mem.used / (1024 ** 3), 1)
-    ram_total= round(mem.total / (1024 ** 3), 1)
-
-    gpu_stats = {
-        "gpu_util": 0,
-        "vram_used_mb": 0,
-        "vram_total_mb": 0,
-        "vram_percent": 0.0,
-        "gpu_temp": 0,
+    """Collect CPU/RAM/GPU/VRAM stats (GPU via NVML only)."""
+    mem = psutil.virtual_memory()
+    stats: dict[str, Any] = {
+        "cpu_percent":  round(psutil.cpu_percent(interval=None), 1),
+        "ram_percent":  round(mem.percent, 1),
+        "ram_used_gb":  round(mem.used / (1024 ** 3), 1),
+        "ram_total_gb": round(mem.total / (1024 ** 3), 1),
+        "gpu_available": False,
+        "gpu_util": 0, "vram_used_mb": 0, "vram_total_mb": 0, "vram_percent": 0.0, "gpu_temp": 0,
     }
-
-    # Only attempt NVML / GPU polling if PyTorch CUDA is detected as available
-    try:
-        import torch
-        if torch.cuda.is_available():
+    nv, h = _nvml_handle()
+    if nv:
+        try:
+            util = nv.nvmlDeviceGetUtilizationRates(h)
+            mem_info = nv.nvmlDeviceGetMemoryInfo(h)
             try:
-                from pynvml import (nvmlInit, nvmlDeviceGetHandleByIndex,
-                                     nvmlDeviceGetUtilizationRates, nvmlDeviceGetMemoryInfo,
-                                     nvmlDeviceGetTemperature, NVML_TEMPERATURE_GPU)
-            except ImportError:
-                from nvidia_ml_py import (nvmlInit, nvmlDeviceGetHandleByIndex,
-                                           nvmlDeviceGetUtilizationRates, nvmlDeviceGetMemoryInfo,
-                                           nvmlDeviceGetTemperature, NVML_TEMPERATURE_GPU)
-            nvmlInit()
-            h        = nvmlDeviceGetHandleByIndex(0)
-            util     = nvmlDeviceGetUtilizationRates(h)
-            mem_info = nvmlDeviceGetMemoryInfo(h)
-            temp     = 0
-            try:
-                temp = nvmlDeviceGetTemperature(h, NVML_TEMPERATURE_GPU)
+                temp = nv.nvmlDeviceGetTemperature(h, nv.NVML_TEMPERATURE_GPU)
             except Exception:
-                pass
-            gpu_stats = {
-                "gpu_util":      util.gpu,
-                "vram_used_mb":  mem_info.used // (1024 ** 2),
-                "vram_total_mb": mem_info.total // (1024 ** 2),
-                "vram_percent":  round(mem_info.used / mem_info.total * 100, 1) if mem_info.total else 0,
-                "gpu_temp":      temp,
-            }
-    except Exception:
-        pass
+                temp = 0
+            stats.update(
+                gpu_available=True,
+                gpu_util=util.gpu,
+                vram_used_mb=mem_info.used // (1024 ** 2),
+                vram_total_mb=mem_info.total // (1024 ** 2),
+                vram_percent=round(mem_info.used / mem_info.total * 100, 1) if mem_info.total else 0,
+                gpu_temp=temp,
+            )
+        except Exception:
+            pass
+    return stats
 
-    return {
-        "cpu_percent":  round(cpu_pct, 1),
-        "ram_percent":  round(ram_pct, 1),
-        "ram_used_gb":  ram_used,
-        "ram_total_gb": ram_total,
-        **gpu_stats,
+
+def _status_payload(session: _Session, brief: bool = False) -> dict:
+    elapsed = None
+    if session.start_time:
+        elapsed = round((session.end_time or time.time()) - session.start_time)
+    out = {
+        "status":       session.status,
+        "session_id":   session.session_id,
+        "run_id":       session.run_id,
+        "run_name":     session.run_name,
+        "epoch":        session.epoch,
+        "total_epochs": session.total_epochs,
+        "elapsed_sec":  elapsed,
+        "error":        session.error,
+        "final_result": session.final_result,
     }
+    if not brief:
+        out.update(config=session.config, epoch_history=session.epoch_history,
+                   log_tail=list(session.log_tail))
+    return out
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -637,90 +745,35 @@ def _build_hardware_stats() -> dict:
 @router.get("/api/train/system-info")
 async def get_system_info(_admin: dict = Depends(get_admin_user)):
     """One-shot system snapshot for the info banner."""
-    info: dict = {}
-
-    # Torch / CUDA (runtime)
-    cuda_avail = False
-    try:
-        import torch
-        info["torch_version"]  = torch.__version__
-        cuda_avail             = torch.cuda.is_available()
-        info["cuda_available"] = cuda_avail
-        info["cuda_version"]   = torch.version.cuda or "N/A"
-        if cuda_avail:
-            info["gpu_name_torch"] = torch.cuda.get_device_name(0)
-    except ImportError:
-        info["torch_version"]  = "Not installed — run pip install"
-        info["cuda_available"] = False
-        info["cuda_version"]   = "N/A"
-
-    if cuda_avail:
-        # GPU info via nvidia-smi (name, memory, driver version)
-        rc, out, _ = _run_sync([
-            "nvidia-smi",
-            "--query-gpu=name,memory.total,driver_version",
-            "--format=csv,noheader,nounits",
-        ], timeout=4)
-        if rc == 0:
-            parts = [p.strip() for p in out.strip().split(",")]
-            info["gpu_name"]       = parts[0] if len(parts) > 0 else "N/A"
-            info["vram_total_mb"]  = int(parts[1]) if len(parts) > 1 else 0
-            info["driver_version"] = parts[2] if len(parts) > 2 else "N/A"
-        else:
-            info["gpu_name"]      = "GPU not detected"
-            info["vram_total_mb"] = 0
-
-        # CUDA driver version from nvidia-smi
-        rc2, out2, _ = _run_sync(["nvidia-smi"], timeout=4)
-        if rc2 == 0:
-            for line in out2.splitlines():
-                if "CUDA Version:" in line:
-                    m = re.search(r"CUDA Version:\s*([\d.]+)", line)
-                    info["cuda_driver_version"] = m.group(1) if m else "N/A"
-                    break
-        if "cuda_driver_version" not in info:
-            info["cuda_driver_version"] = "N/A"
-    else:
-        info["gpu_name"]            = "None (CPU Mode)"
-        info["vram_total_mb"]       = 0
-        info["driver_version"]      = "N/A (CPU Mode)"
-        info["cuda_driver_version"] = "N/A"
-
-    info["default_device"] = "0" if cuda_avail else "cpu"
-
-    # Ultralytics
-    try:
-        import ultralytics
-        info["ultralytics_version"] = ultralytics.__version__
-    except ImportError:
+    info: dict = await asyncio.to_thread(_runtime_info)
+    if not info.get("torch_version"):
+        info["torch_version"] = "Not installed — run pip install"
+    if not info.get("ultralytics_version"):
         info["ultralytics_version"] = "Not installed — run pip install ultralytics"
+    cuda_avail = bool(info.get("cuda_available"))
+    info["cuda_available"] = cuda_avail
+    info.setdefault("cuda_version", "N/A")
 
-    # CPU / RAM
+    gpu = await asyncio.to_thread(_gpu_static_info) if cuda_avail else {}
+    info["gpu_name"]            = gpu.get("gpu_name", "GPU not detected" if cuda_avail else "None (CPU Mode)")
+    info["gpu_name_torch"]      = info["gpu_name"]
+    info["vram_total_mb"]       = gpu.get("vram_total_mb", 0)
+    info["driver_version"]      = gpu.get("driver_version", "N/A")
+    info["cuda_driver_version"] = gpu.get("cuda_driver_version", "N/A")
+    info["default_device"]      = "0" if cuda_avail else "cpu"
+
     info["cpu_count"]          = psutil.cpu_count(logical=True)
     info["cpu_count_physical"] = psutil.cpu_count(logical=False) or 1
     mem = psutil.virtual_memory()
     info["ram_total_gb"]       = round(mem.total     / (1024 ** 3), 1)
     info["ram_available_gb"]   = round(mem.available / (1024 ** 3), 1)
-
-    # CPU frequency
     try:
         freq = psutil.cpu_freq()
-        if freq:
-            info["cpu_freq_mhz"] = round(freq.max or freq.current, 0)
-        else:
-            info["cpu_freq_mhz"] = None
+        info["cpu_freq_mhz"] = round(freq.max or freq.current, 0) if freq else None
     except Exception:
         info["cpu_freq_mhz"] = None
-
-    # VRAM in GB for convenience
-    if info.get("vram_total_mb", 0) > 0:
-        info["vram_total_gb"] = round(info["vram_total_mb"] / 1024, 1)
-    else:
-        info["vram_total_gb"] = 0.0
-
-    # Python
+    info["vram_total_gb"] = round(info["vram_total_mb"] / 1024, 1) if info["vram_total_mb"] else 0.0
     info["python_version"] = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-
     return info
 
 
@@ -733,35 +786,27 @@ class RecommendRequest(BaseModel):
     ram_available_gb: float = 8.0
     cpu_count_physical: int = 2
     memory_budget_gb: Optional[float] = None
+    model: Optional[str] = None
 
 
 @router.post("/api/train/recommend")
 async def get_recommendation(req: RecommendRequest, _admin: dict = Depends(get_admin_user)):
-    """
-    Rule-based recommendation engine.
-    Accepts combined dataset + system stats; returns optimal model + params with rationale.
-    """
-    rec = _recommend_params(req.model_dump(), req.model_dump())
-    return rec
+    """Rule-based suggested settings with a rationale for each field."""
+    return _recommend_params(req.model_dump(), req.model_dump())
 
 
 @router.get("/api/train/system-stats")
 async def get_system_stats(_admin: dict = Depends(get_admin_user)):
-    """Real-time hardware usage (polled every 2 s by the frontend)."""
-    return _build_hardware_stats()
+    """Real-time hardware usage (polled by the frontend while idle)."""
+    return await asyncio.to_thread(_build_hardware_stats)
 
 
 @router.get("/api/train/pick-dataset")
 async def pick_dataset(_admin: dict = Depends(get_admin_user)):
-    """Open native folder picker and return selected path."""
-    import sys as _sys
+    """Open native folder picker (on the server's screen) and return the selected path."""
     script = Path(__file__).parent / "pick_folder.py"
-    loop = asyncio.get_event_loop()
-    rc, out, _ = await loop.run_in_executor(
-        None,
-        lambda: _run_sync([_sys.executable, str(script)], timeout=120),
-    )
-    if rc != 0:
+    rc, out, _ = await asyncio.to_thread(_run_sync, [sys.executable, str(script)], 300)
+    if rc != 0 or not out.strip():
         raise HTTPException(status_code=400, detail="No folder selected")
     return {"path": out.strip()}
 
@@ -769,233 +814,397 @@ async def pick_dataset(_admin: dict = Depends(get_admin_user)):
 @router.get("/api/train/pick-yaml")
 async def pick_yaml(_admin: dict = Depends(get_admin_user)):
     """Open native file picker specifically for .yaml/.yml files."""
-    import sys as _sys
     script = Path(__file__).parent / "pick_file.py"
-    loop = asyncio.get_event_loop()
-    rc, out, _ = await loop.run_in_executor(
-        None,
-        lambda: _run_sync([_sys.executable, str(script), "--yaml"], timeout=120),
-    )
-    if rc != 0:
+    rc, out, _ = await asyncio.to_thread(_run_sync, [sys.executable, str(script), "--yaml"], 300)
+    if rc != 0 or not out.strip():
         raise HTTPException(status_code=400, detail="No file selected")
     path = out.strip()
-    if not path.lower().endswith(('.yaml', '.yml')):
+    if not path.lower().endswith((".yaml", ".yml")):
         raise HTTPException(status_code=400, detail="Selected file is not a YAML file")
     return {"path": path}
 
 
-@router.post("/api/train/validate-dataset")
-async def validate_dataset(req: ValidateDatasetRequest, _admin: dict = Depends(get_admin_user)):
-    """Validate a dataset folder — checks splits + yaml presence + extended stats."""
-    path = Path(req.path)
+_SCAN_CAP = 200_000
 
-    errors: list[str]   = []
+
+def _count_split(target: Path) -> int:
+    """Images in a split directory (recursive, capped) or lines in an image-list .txt."""
+    if target.is_file() and target.suffix.lower() == ".txt":
+        try:
+            return sum(1 for ln in target.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip())
+        except OSError:
+            return 0
+    if not target.is_dir():
+        return 0
+    n = 0
+    for f in target.rglob("*"):
+        if f.suffix.lower() in _IMG_EXTS:
+            n += 1
+            if n >= _SCAN_CAP:
+                break
+    return n
+
+
+def resolve_data_yaml(yaml_path: Path) -> Optional[dict]:
+    """
+    Read a data.yaml and resolve every split to an absolute path. A relative `path:` (or none)
+    counts from the yaml's own folder — what people mean, and how Roboflow / our exports are
+    laid out — and "../x" entries fall back to "x" like Ultralytics does. The training worker
+    receives these absolute paths, so the validator and the trainer can't disagree.
+    Returns the yaml dict with absolute paths, or None if it is not a dataset yaml.
+    """
+    import yaml
+    try:
+        data = yaml.safe_load(yaml_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+    if not isinstance(data, dict) or "train" not in data:
+        return None
+    base = Path(data["path"]) if data.get("path") else yaml_path.parent
+    if not base.is_absolute():
+        in_yaml_dir = (yaml_path.parent / base).resolve()
+        base = in_yaml_dir if in_yaml_dir.exists() or not base.resolve().exists() else base.resolve()
+
+    def resolve(entry: str) -> Path:
+        x = Path(entry) if Path(entry).is_absolute() else (base / entry).resolve()
+        if not x.exists() and str(entry).startswith("../"):
+            x = (base / entry[3:]).resolve()
+        return x
+
+    out = {k: v for k, v in data.items() if k != "download"}     # never run a download script
+    out["path"] = str(base)
+    for key in ("train", "val", "test"):
+        entries = data.get(key)
+        if not entries:
+            out.pop(key, None)
+            continue
+        resolved = [str(resolve(e)) for e in (entries if isinstance(entries, list) else [entries])]
+        out[key] = resolved if isinstance(entries, list) else resolved[0]
+    if "val" not in out and data.get("validation"):
+        out["val"] = str(resolve(data["validation"]))
+    return out
+
+
+def _splits_from_yaml(yaml_path: Path) -> Optional[dict]:
+    data = resolve_data_yaml(yaml_path)
+    if data is None:
+        return None
+    out = {}
+    for key, split in (("train", "train"), ("val", "valid"), ("test", "test")):
+        entries = data.get(key)
+        paths = [Path(e) for e in (entries if isinstance(entries, list) else ([entries] if entries else []))]
+        count = sum(_count_split(p) for p in paths)
+        out[split] = {"exists": bool(paths) and any(p.exists() for p in paths), "count": count,
+                      "path": str(paths[0]) if paths else None}
+    return out
+
+
+_BASE_WEIGHTS = re.compile(r"^(yolo[\w.-]*|rtdetr[\w.-]*|yoloe[\w.-]*)\.pt$", re.IGNORECASE)
+
+
+def resolve_model(name: str) -> str:
+    """
+    What the worker may load: an official base-weights name (looked up / downloaded in the
+    model cache) or a .pt inside models/, training_runs/ or the model cache. Anything else —
+    URLs, UNC paths, files elsewhere — is refused: a .pt is a pickle, loading it runs code.
+    """
+    name = (name or "").strip().strip('"')
+    if _BASE_WEIGHTS.match(name):
+        return name
+    for root in (MODELS_DIR, TRAINING_RUNS_DIR, MODEL_CACHE_DIR):
+        cand = Path(name) if Path(name).is_absolute() else root / name
+        try:
+            cand = cand.resolve()
+            cand.relative_to(root.resolve())
+        except (ValueError, OSError):
+            continue
+        if cand.suffix == ".pt" and cand.is_file():
+            return str(cand)
+    raise HTTPException(status_code=400, detail="Model must be a base model name (e.g. yolo11n.pt) or a .pt in models/")
+
+
+def link_or_copy(src: Path, dst: Path) -> bool:
+    """Hard-link (same drive: no extra space) or copy a finished checkpoint into models/."""
+    if not src or not Path(src).exists():
+        return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(".pt.tmp")
+    tmp.unlink(missing_ok=True)
+    try:
+        os.link(src, tmp)
+    except OSError:
+        shutil.copy2(src, tmp)
+    os.replace(tmp, dst)
+    return True
+
+
+def recover_unlinked_runs() -> int:
+    """Startup: runs whose weights never reached models/ (server stopped mid-run) get linked now."""
+    n = 0
+    for run in TRAINING_RUNS_DIR.iterdir() if TRAINING_RUNS_DIR.exists() else []:
+        weights = run / "weights"
+        dest = MODELS_DIR / run.name
+        for f in ("best.pt", "last.pt"):
+            if (weights / f).exists() and not (dest / f).exists():
+                n += link_or_copy(weights / f, dest / f)
+    return n
+
+
+def _validate_dataset_sync(path: Path) -> dict:
+    errors: list[str] = []
     warnings: list[str] = []
-    splits: dict        = {}
 
-    if not path.exists():
-        return {"is_valid": False, "errors": ["Folder does not exist"], "warnings": [], "splits": {}, "yaml": None}
-    if not path.is_dir():
-        return {"is_valid": False, "errors": ["Path is not a directory"], "warnings": [], "splits": {}, "yaml": None}
-
-    for split in ("train", "valid", "test"):
-        img_subdir = path / split / "images"
-        direct_dir = path / split
-        if img_subdir.exists():
-            cnt = _count_images(img_subdir)
-            splits[split] = {"exists": True, "count": cnt, "path": str(img_subdir)}
-        elif direct_dir.exists():
-            cnt = _count_images(direct_dir)
-            splits[split] = {"exists": bool(cnt), "count": cnt, "path": str(direct_dir)}
-        else:
-            splits[split] = {"exists": False, "count": 0, "path": None}
+    yaml_path = _find_yaml(path)
+    splits = _splits_from_yaml(yaml_path) if yaml_path else None
+    if splits is None:
+        splits = {}
+        for split, names in (("train", ("train",)), ("valid", ("valid", "val")), ("test", ("test",))):
+            info = {"exists": False, "count": 0, "path": None}
+            for name in names:
+                for candidate in (path / name / "images", path / "images" / name, path / name):
+                    if candidate.is_dir():
+                        cnt = _count_split(candidate)
+                        if cnt:
+                            info = {"exists": True, "count": cnt, "path": str(candidate)}
+                            break
+                if info["exists"]:
+                    break
+            splits[split] = info
 
     if not splits["train"]["exists"]:
-        errors.append("train/ split not found — required for training")
+        errors.append("Training split not found — required for training")
     elif splits["train"]["count"] == 0:
-        errors.append("train/ split exists but contains no images")
-
+        errors.append("Training split contains no images")
     if not splits.get("valid", {}).get("exists"):
-        warnings.append("valid/ split not found (optional but recommended for mAP tracking)")
+        warnings.append("Validation split not found (optional, but needed for mAP tracking)")
 
-    # YAML
-    yaml_path = _find_yaml(path)
     yaml_info = {"exists": bool(yaml_path), "path": str(yaml_path) if yaml_path else None}
     if not yaml_path:
         warnings.append("No data.yaml found in this folder — you can provide one manually below")
 
-    # ── Extended dataset stats ─────────────────────────────────────────────────
     total_images = sum(s["count"] for s in splits.values() if s.get("exists"))
-
-    # Dataset disk size (compute async to avoid blocking too long on huge datasets)
-    loop = asyncio.get_event_loop()
-    total_size_mb = await loop.run_in_executor(None, _folder_size_mb, path)
-
-    # Parse YAML for class info
     yaml_data = _parse_yaml_info(yaml_path) if yaml_path else {"num_classes": None, "class_names": []}
-
-    # Split ratio (percentages, only among existing splits)
     split_counts = {s: splits[s]["count"] for s in ("train", "valid", "test") if splits[s].get("exists")}
-    split_total  = sum(split_counts.values()) or 1
-    split_ratios = {s: round(c / split_total * 100, 1) for s, c in split_counts.items()}
-
-    is_valid = len(errors) == 0
+    split_total = sum(split_counts.values()) or 1
 
     return {
-        "is_valid":      is_valid,
+        "is_valid":      not errors,
         "path":          str(path),
         "splits":        splits,
         "yaml":          yaml_info,
         "errors":        errors,
         "warnings":      warnings,
-        # Extended stats
         "total_images":  total_images,
-        "total_size_mb": total_size_mb,
+        "total_size_mb": _folder_size_mb(path),
         "num_classes":   yaml_data["num_classes"],
         "class_names":   yaml_data["class_names"],
-        "split_ratios":  split_ratios,
+        "split_ratios":  {s: round(c / split_total * 100, 1) for s, c in split_counts.items()},
     }
+
+
+@router.post("/api/train/validate-dataset")
+async def validate_dataset(req: ValidateDatasetRequest, _admin: dict = Depends(get_admin_user)):
+    """Validate a dataset folder — splits (from data.yaml when present), yaml, extended stats."""
+    raw = req.path.strip().strip('"')
+    if not raw:
+        return {"is_valid": False, "errors": ["Enter a dataset folder"], "warnings": [], "splits": {}, "yaml": None}
+    path = Path(raw)
+    if not path.exists():
+        return {"is_valid": False, "errors": ["Folder does not exist"], "warnings": [], "splits": {}, "yaml": None}
+    if not path.is_dir():
+        return {"is_valid": False, "errors": ["Path is not a directory"], "warnings": [], "splits": {}, "yaml": None}
+    return await asyncio.to_thread(_validate_dataset_sync, path)
 
 
 @router.post("/api/train/start")
 async def start_training(req: StartTrainingRequest, _admin: dict = Depends(get_admin_user)):
     """Launch a new training subprocess. Only one session at a time."""
-    global _session
-
-    if _session.status == "running":
-        raise HTTPException(status_code=409, detail="Training is already in progress")
-
-    # Validate critical paths
-    yaml_path = Path(req.yaml_path)
-    if not yaml_path.exists():
+    yaml_path = Path(req.yaml_path.strip().strip('"'))
+    if not yaml_path.is_file():
         raise HTTPException(status_code=400, detail=f"YAML not found: {req.yaml_path}")
+    data = await asyncio.to_thread(resolve_data_yaml, yaml_path)
+    if data is None:
+        raise HTTPException(status_code=400, detail="This file is not a dataset yaml (it needs a 'train:' entry)")
+    model = resolve_model(req.model)
 
-    # Build a safe run name — prefer user-provided override
-    safe_ds = re.sub(r"[^\w\-]", "_", req.dataset_name)[:40]
-    model_tag = req.model.replace(".pt", "")
+    safe_ds = re.sub(r"[^\w\-]", "_", req.dataset_name)[:40] or "dataset"
+    model_tag = re.sub(r"[^\w\-]", "_", Path(req.model).stem)[:30] or "model"
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     if req.run_name_override and req.run_name_override.strip():
-        safe_override = re.sub(r"[^\w\-]", "_", req.run_name_override.strip())[:40]
-        run_name = f"{safe_override}_{ts}"
+        run_name = f"{re.sub(r'[^\w\-]', '_', req.run_name_override.strip())[:40]}_{ts}"
     else:
         run_name = f"{safe_ds}_{model_tag}_{ts}"
 
-    worker_config = {
-        "model":             req.model,
-        "data":              str(yaml_path.as_posix()),
-        "dataset_name":      safe_ds,
-        "epochs":            req.epochs,
-        "batch":             req.batch,
-        "imgsz":             req.imgsz,
-        "patience":          req.patience,
-        "lr0":               req.lr0,
-        "optimizer":         req.optimizer,
-        "workers":           req.workers,
-        "device":            req.device,
-        "cos_lr":            req.cos_lr,
-        "warmup_epochs":     req.warmup_epochs,
-        "weight_decay":      req.weight_decay,
-        "mosaic":            req.mosaic,
-        "memory_budget_gb":  req.memory_budget_gb,
-        "project":           str(TRAINING_RUNS_DIR.as_posix()),
-        "name":              run_name,
-    }
+    # The worker trains on a cleaned copy with absolute paths, kept with the run
+    import yaml as _yaml
+    run_dir = TRAINING_RUNS_DIR / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    clean_yaml = run_dir / "data.yaml"
+    clean_yaml.write_text(_yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
-    # Reset session
-    _session.reset()
-    _session.session_id   = str(uuid.uuid4())[:8]
-    _session.start_time   = time.time()
-    _session.config       = worker_config
-    _session.status       = "running"
-    _session.total_epochs = req.epochs
-
-    # Launch subprocess
-    flags = 0
-    if os.name == "nt":
-        flags = subprocess.CREATE_NO_WINDOW
-
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable,
-        str(WORKER_SCRIPT),
-        json.dumps(worker_config),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,   # merge stderr into stdout
-        creationflags=flags,
-    )
-    _session.process = proc
-
-    # Background tasks: stream reader + hardware monitor
-    _session._stream_task  = asyncio.create_task(_stream_training())
-    _session._monitor_task = asyncio.create_task(_hardware_monitor())
-
-    return {
-        "session_id":   _session.session_id,
-        "run_name":     run_name,
-        "total_epochs": req.epochs,
-        "status":       "running",
-    }
+    config = {k: v for k, v in req.model_dump().items() if k not in ("dataset_path", "run_name_override")}
+    return await _launch(run_name, {**config, "model": model, "data": clean_yaml.as_posix(),
+                                    "dataset_name": safe_ds, "source_yaml": str(yaml_path)}, resume=False)
 
 
-@router.post("/api/train/stop")
-async def stop_training(_admin: dict = Depends(get_admin_user)):
-    """Gracefully stop the running training subprocess."""
+async def _launch(run_name: str, cfg: dict, resume: bool) -> dict:
     global _session
+    from app.compute import default_device
 
-    if _session.status != "running":
-        raise HTTPException(status_code=400, detail="No active training session to stop")
+    async with _session_lock:
+        old = _session
+        if old.status in ("running", "stopping"):
+            raise HTTPException(status_code=409, detail="Training is already in progress")
+        if old.process and old.process.returncode is None:
+            raise HTTPException(status_code=409, detail="The previous run is still shutting down — try again shortly")
 
-    _session.status = "stopping"
+        device = str(cfg.get("device") or "auto").strip().lower()
+        if device in ("auto", ""):
+            device = await asyncio.to_thread(default_device)
 
-    proc = _session.process
-    if proc and proc.returncode is None:
+        session = _Session()
+        session.session_id = uuid.uuid4().hex[:8]
+        session.run_name = run_name
+        session.stop_file = DATA_DIR / f"train_stop_{session.session_id}.flag"
+        session.stop_file.unlink(missing_ok=True)
+
+        worker_config = {
+            "model":            cfg["model"],
+            "data":             cfg["data"],
+            "resume":           resume,
+            "dataset_name":     cfg.get("dataset_name"),
+            "epochs":           cfg["epochs"],
+            "batch":            cfg["batch"],
+            "imgsz":            cfg["imgsz"],
+            "patience":         cfg["patience"],
+            "lr0":              cfg["lr0"],
+            "optimizer":        cfg["optimizer"],
+            "workers":          cfg["workers"],
+            "device":           device,
+            "cos_lr":           cfg["cos_lr"],
+            "warmup_epochs":    cfg["warmup_epochs"],
+            "weight_decay":     cfg["weight_decay"],
+            "mosaic":           cfg["mosaic"],
+            "memory_budget_gb": cfg.get("memory_budget_gb"),
+            "project":          TRAINING_RUNS_DIR.as_posix(),
+            "name":             run_name,
+            "stop_file":        str(session.stop_file),
+            "parent_pid":       os.getpid(),
+        }
+        session.start_time = time.time()
+        session.config = worker_config
+        session.total_epochs = cfg["epochs"]
+
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
-            proc.terminate()
-            await asyncio.wait_for(proc.wait(), timeout=10)
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, str(WORKER_SCRIPT), json.dumps(worker_config),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,   # merge stderr into stdout
+                creationflags=flags,
+                cwd=str(MODEL_CACHE_DIR),           # base weights download here, not into the repo
+            )
+        except Exception as exc:
+            session.status = "error"
+            session.error = f"Could not start the training process: {exc}"
+            session.end_time = time.time()
+            _session = session
+            raise HTTPException(status_code=500, detail=session.error)
+
+        session.process = proc
+        session.status = "running"
+        _session = session
+        session.run_id = await _record_run_start(run_name, cfg, worker_config, resume)
+        session._stream_task = asyncio.create_task(_stream_training(session))
+        session._monitor_task = asyncio.create_task(_hardware_monitor(session))
+
+    await emit_train_status(_status_payload(session, brief=True))   # other tabs switch to "training" at once
+    return {"session_id": session.session_id, "run_name": run_name, "run_id": session.run_id,
+            "total_epochs": cfg["epochs"], "status": "running", "device": device}
+
+
+async def _record_run_start(run_name: str, cfg: dict, worker_config: dict, resume: bool) -> str:
+    async with connect() as db:
+        cur = await db.execute("SELECT id FROM training_runs WHERE name = ?", (run_name,))
+        row = await cur.fetchone()
+        if row:                                          # resume continues the same run
+            await db.execute("UPDATE training_runs SET status='running', finished_at=NULL, error=NULL WHERE id = ?",
+                             (row["id"],))
+            run_id = row["id"]
+        else:
+            run_id = new_id()
+            public = {k: v for k, v in worker_config.items() if k not in ("stop_file", "parent_pid", "project")}
+            await db.execute(
+                "INSERT INTO training_runs (id, name, source, status, model, dataset, config, total_epochs, started_at) "
+                "VALUES (?, ?, 'local', 'running', ?, ?, ?, ?, ?)",
+                (run_id, run_name, Path(cfg["model"]).name, cfg.get("dataset_name"), json.dumps(public),
+                 cfg["epochs"], now_iso()),
+            )
+        await db.commit()
+    return run_id
+
+
+async def _stop(session: _Session, grace: float) -> None:
+    """Ask the worker to stop between batches; kill the whole process tree if it doesn't."""
+    proc = session.process
+    if not proc or proc.returncode is not None:
+        return
+    if session.stop_file:
+        session.stop_file.touch()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=grace)
+    except asyncio.TimeoutError:
+        await asyncio.to_thread(_kill_tree, proc.pid)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-        except ProcessLookupError:
             pass
 
-    # Cancel background tasks
-    for task in (_session._stream_task, _session._monitor_task):
-        if task and not task.done():
-            task.cancel()
 
-    _session.status = "stopped"
-    await emit_train_status({"status": "stopped"})
-    await emit_train_log("[INFO] Training stopped by user.")
-    return {"status": "stopped"}
+@router.post("/api/train/stop", status_code=202)
+async def stop_training(_admin: dict = Depends(get_admin_user)):
+    """Ask the run to stop after the current batch (forced after 30 s). Returns at once."""
+    session = _session
+    if session.status == "stopping":
+        return {"status": "stopping"}
+    if session.status != "running":
+        raise HTTPException(status_code=400, detail="No active training session to stop")
+
+    session.status = "stopping"
+    await _log(session, "[INFO] Stop requested — finishing the current batch…")
+    await emit_train_status(_status_payload(session, brief=True))
+
+    async def finish():
+        await _stop(session, grace=30)
+        if session._stream_task:
+            try:
+                await asyncio.wait_for(asyncio.shield(session._stream_task), timeout=10)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+        if session.status == "stopping":
+            session.status = "stopped"
+            session.end_time = time.time()
+            await _finalise_run(session)
+            await emit_train_status(_status_payload(session, brief=True))
+
+    session._stop_task = asyncio.create_task(finish())
+    return {"status": "stopping"}
 
 
 @router.get("/api/train/status")
 async def get_training_status(_admin: dict = Depends(get_admin_user)):
-    """Return current session state (used on reconnect)."""
-    elapsed = None
-    if _session.start_time and _session.status in ("running", "stopping"):
-        elapsed = round(time.time() - _session.start_time)
-
-    return {
-        "status":       _session.status,
-        "session_id":   _session.session_id,
-        "epoch":        _session.epoch,
-        "total_epochs": _session.total_epochs,
-        "elapsed_sec":  elapsed,
-        "config":       _session.config,
-        "final_result": _session.final_result,
-    }
+    """Full session state including epoch history and recent log lines (reload / reconnect)."""
+    return _status_payload(_session)
 
 
 @router.get("/api/train/models")
 async def list_models(_admin: dict = Depends(get_admin_user)):
     """List all saved .pt files in the models/ directory."""
     models = []
-    all_pt_files = list(MODELS_DIR.rglob("*.pt"))
-    for f in sorted(all_pt_files, key=lambda x: x.stat().st_mtime, reverse=True):
+    for f in sorted(MODELS_DIR.rglob("*.pt"), key=lambda x: x.stat().st_mtime, reverse=True):
         stat = f.stat()
-        rel_path = f.relative_to(MODELS_DIR)
         models.append({
-            "name":     str(rel_path).replace("\\", "/"),
+            "name":     f.relative_to(MODELS_DIR).as_posix(),
             "size_mb":  round(stat.st_size / (1024 ** 2), 1),
             "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
             "path":     str(f),
@@ -1004,46 +1213,170 @@ async def list_models(_admin: dict = Depends(get_admin_user)):
 
 
 @router.get("/api/train/models/{model_path:path}")
-async def download_model(model_path: str, _admin: dict = Depends(get_admin_user)):
-    """Download a .pt model file."""
-    # Prevent path traversal
-    if ".." in model_path:
-        raise HTTPException(status_code=400, detail="Invalid path")
-    
-    model_file = MODELS_DIR / model_path
-    
+async def download_model(model_path: str, _admin: dict = Depends(get_admin_header_or_query)):
+    """Download a .pt model file (links pass ?token= because <a href> can't send headers)."""
+    model_file = (MODELS_DIR / model_path).resolve()
     try:
-        model_file.resolve().relative_to(MODELS_DIR.resolve())
+        model_file.relative_to(MODELS_DIR.resolve())
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid path")
-
-    if not model_file.exists() or model_file.suffix != ".pt":
+    if not model_file.is_file() or model_file.suffix != ".pt":
         raise HTTPException(status_code=404, detail="Model not found")
-        
-    return FileResponse(
-        path=str(model_file),
-        filename=model_file.name,
-        media_type="application/octet-stream",
-    )
+
+    # e.g. "HelmetSet_yolo11n_20260927_best.pt" instead of a bare "best.pt"
+    parent = model_file.parent.name if model_file.parent != MODELS_DIR.resolve() else ""
+    download_name = f"{parent}_{model_file.name}" if parent else model_file.name
+    return FileResponse(path=str(model_file), filename=download_name, media_type="application/octet-stream")
+
+
+def _run_out(r: dict) -> dict:
+    out = dict(r)
+    out["config"] = json.loads(out.get("config") or "{}")
+    out["metrics"] = json.loads(out.get("metrics") or "{}")
+    folder = MODELS_DIR / out["name"]
+    out["best_pt"] = f"{out['name']}/best.pt" if (folder / "best.pt").exists() else None
+    out["last_pt"] = f"{out['name']}/last.pt" if (folder / "last.pt").exists() else None
+    out["can_resume"] = (out["source"] == "local" and out["status"] in ("stopped", "interrupted", "error")
+                         and (TRAINING_RUNS_DIR / out["name"] / "weights" / "last.pt").exists())
+    plots = sorted({f.name for f in (TRAINING_RUNS_DIR / out["name"]).glob("*.png")}
+                   | {f"plots/{f.name}" for f in (folder / "plots").glob("*.png")})
+    out["plots"] = [p for p in plots if not p.split("/")[-1].startswith(("train_batch", "val_batch", "labels"))]
+    return out
+
+
+_RUN_FILE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".csv": "text/csv", ".yaml": "text/plain"}
+
+
+@router.get("/api/train/runs/{run_id}/files/{rel:path}")
+async def run_file(run_id: str, rel: str, _admin: dict = Depends(get_admin_header_or_query)):
+    """A plot / results.csv / args.yaml of a run (from training_runs/<run>/ or models/<run>/)."""
+    async with connect() as db:
+        cur = await db.execute("SELECT name FROM training_runs WHERE id = ?", (run_id,))
+        row = await cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    for root in (TRAINING_RUNS_DIR / row["name"], MODELS_DIR / row["name"]):
+        f = (root / rel).resolve()
+        try:
+            f.relative_to(root.resolve())
+        except ValueError:
+            continue
+        if f.suffix.lower() in _RUN_FILE_TYPES and f.is_file():
+            return FileResponse(f, media_type=_RUN_FILE_TYPES[f.suffix.lower()])
+    raise HTTPException(status_code=404, detail="File not found")
+
+
+@router.get("/api/train/runs")
+async def list_runs(_admin: dict = Depends(get_admin_user)):
+    async with connect() as db:
+        cur = await db.execute("SELECT * FROM training_runs ORDER BY started_at DESC")
+        rows = [dict(r) for r in await cur.fetchall()]
+    return {"runs": await asyncio.to_thread(lambda: [_run_out(r) for r in rows])}
+
+
+@router.post("/api/train/runs/{run_id}/resume")
+async def resume_run(run_id: str, _admin: dict = Depends(get_admin_user)):
+    """Continue an interrupted run from its last.pt (same epochs, data and settings)."""
+    async with connect() as db:
+        cur = await db.execute("SELECT * FROM training_runs WHERE id = ?", (run_id,))
+        row = await cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    run = _run_out(dict(row))
+    if not run["can_resume"]:
+        raise HTTPException(status_code=400, detail="This run has no checkpoint to resume from")
+    last = TRAINING_RUNS_DIR / run["name"] / "weights" / "last.pt"
+    cfg = {**run["config"], "model": str(last), "epochs": run["total_epochs"] or run["config"].get("epochs", 100)}
+    for k, v in StartTrainingRequest.model_fields.items():
+        cfg.setdefault(k, v.default)
+    return await _launch(run["name"], cfg, resume=True)
+
+
+@router.delete("/api/train/runs/{run_id}")
+async def delete_run(run_id: str, _admin: dict = Depends(get_admin_user)):
+    """Delete a run: its row, models/<run>/ and training_runs/<run>/ (frees the disk space)."""
+    async with connect() as db:
+        cur = await db.execute("SELECT name, status FROM training_runs WHERE id = ?", (run_id,))
+        row = await cur.fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if row["status"] == "running" or (_session.run_id == run_id and _session.status in ("running", "stopping")):
+            raise HTTPException(status_code=409, detail="Stop the run before deleting it")
+        await db.execute("DELETE FROM training_runs WHERE id = ?", (run_id,))
+        await db.commit()
+    name = row["name"]
+    for root in (MODELS_DIR, TRAINING_RUNS_DIR):
+        target = (root / name).resolve()
+        if target.parent == root.resolve() and target.exists():
+            await asyncio.to_thread(shutil.rmtree, target, True)
+    return {"detail": f"Deleted {name}"}
+
+
+async def import_legacy_runs() -> int:
+    """Startup: list runs made before run history existed (folders in training_runs/)."""
+    async with connect() as db:
+        cur = await db.execute("SELECT name FROM training_runs")
+        known = {r["name"] for r in await cur.fetchall()}
+        added = 0
+        for run in sorted(TRAINING_RUNS_DIR.iterdir()) if TRAINING_RUNS_DIR.exists() else []:
+            if run.name in known or not (run / "weights").exists():
+                continue
+            metrics, epochs, best_epoch = _metrics_from_results_csv(run / "results.csv")
+            args = {}
+            if (run / "args.yaml").exists():
+                import yaml as _yaml
+                try:
+                    args = _yaml.safe_load((run / "args.yaml").read_text(encoding="utf-8")) or {}
+                except Exception:
+                    args = {}
+            started = datetime.fromtimestamp(run.stat().st_mtime).isoformat()
+            await db.execute(
+                "INSERT INTO training_runs (id, name, source, status, model, dataset, config, metrics, best_epoch, "
+                "epochs_done, total_epochs, started_at, finished_at) VALUES (?, ?, 'local', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (new_id(), run.name, "complete" if (run / "weights" / "best.pt").exists() else "stopped",
+                 Path(str(args.get("model", ""))).name or None, Path(str(args.get("data", ""))).parent.name or None,
+                 json.dumps({k: args.get(k) for k in ("epochs", "batch", "imgsz", "optimizer", "lr0", "device") if k in args}),
+                 json.dumps(metrics), best_epoch, epochs, args.get("epochs") or epochs, started, started),
+            )
+            added += 1
+        await db.commit()
+    return added
+
+
+def _metrics_from_results_csv(path: Path) -> tuple[dict, int, Optional[int]]:
+    """Best-epoch metrics from an Ultralytics results.csv (fitness = 0.1·mAP50 + 0.9·mAP50-95)."""
+    import csv
+    if not path.exists():
+        return {}, 0, None
+    try:
+        with open(path, newline="", encoding="utf-8") as fh:
+            rows = [{k.strip(): v.strip() for k, v in r.items() if k} for r in csv.DictReader(fh)]
+    except Exception:
+        return {}, 0, None
+    if not rows:
+        return {}, 0, None
+
+    def f(r, k):
+        try:
+            return float(r.get(k, "nan"))
+        except ValueError:
+            return float("nan")
+    best = max(rows, key=lambda r: (0.1 * f(r, "metrics/mAP50(B)") + 0.9 * f(r, "metrics/mAP50-95(B)"))
+               if f(r, "metrics/mAP50(B)") == f(r, "metrics/mAP50(B)") else -1)
+    metrics = {k: f(best, k) for k in best if k.startswith("metrics/") and f(best, k) == f(best, k)}
+    try:
+        best_epoch = int(float(best.get("epoch", 0)))
+    except ValueError:
+        best_epoch = None
+    return metrics, len(rows), best_epoch
 
 
 async def cleanup_session():
-    """Clean up active training subprocess and background tasks on application shutdown."""
-    global _session
-    if _session.status == "running":
-        _session.status = "stopping"
-        proc = _session.process
-        if proc and proc.returncode is None:
-            try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=2)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-
-    for task in (_session._stream_task, _session._monitor_task):
+    """Stop an active training subprocess on application shutdown."""
+    session = _session
+    if session.process and session.process.returncode is None:
+        session.status = "stopping"
+        await _stop(session, grace=3)
+    for task in (session._stream_task, session._monitor_task):
         if task and not task.done():
             task.cancel()
-

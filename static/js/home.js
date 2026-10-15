@@ -1,471 +1,193 @@
 /**
- * home.js — Home page logic: project card grid, new project modal,
- *            global stats, real-time updates via Socket.IO.
- * v2.0.0
+ * home.js — project list, new project, history, delete. Live stats via socket.
  */
-
+(async () => {
 'use strict';
 
-let _socket = null;
-let _user   = null;
-let _projects = [];
+const user = await IA.shell({ section: 'projects' });
+if (!user) return;
+IA.setCrumbs([{ label: 'Projects' }]);
 
-// ── Init ──────────────────────────────────────────────────────────────────────
+let projects = [];
+const grid = document.getElementById('project-grid');
 
-document.addEventListener('DOMContentLoaded', async () => {
-  _user = IA.requireAuth(false);   // any authenticated user
-  if (!_user) return;
+document.getElementById('home-eyebrow').textContent = user.is_admin ? 'Workspace' : `Signed in as ${user.username}`;
 
-  // Set greeting
-  document.getElementById('greeting-name').textContent = _user.username;
-  document.getElementById('sidebar-username').textContent = _user.username;
-
-  // Show admin-only UI
-  if (_user.is_admin) {
-    document.getElementById('global-stats-bar').style.display = 'flex';
-    document.getElementById('new-project-btn').style.display  = 'inline-flex';
-    const historyBtn = document.getElementById('project-history-btn');
-    if (historyBtn) historyBtn.style.display = 'inline-flex';
-    document.getElementById('projects-section-heading').textContent = 'All Projects';
-    // Set role badge
-    const badge = document.getElementById('topbar-role-badge');
-    if (badge) { badge.textContent = 'ADMIN'; badge.style.display = 'inline'; }
-  } else {
-    document.getElementById('home-subtitle').textContent =
-      'Projects with images assigned to you appear here';
-    document.getElementById('projects-section-heading').textContent = 'Your Projects';
-  }
-
-  await loadProjects();
-
-  // Connect socket — no project_id (home page = global room only)
-  _socket = IA.connectSocket(null, (sock) => {
-    // Re-fetch project list whenever anything changes globally
-    sock.on('projects_changed', () => loadProjects());
-    // Stats changes may affect card progress bars
-    sock.on('stats_update', (data) => {
-      if (data._project_id) updateCardStats(data._project_id, data);
-    });
-  });
-});
-
-// ── Load and render projects ───────────────────────────────────────────────
-
-async function loadProjects() {
-  const res = await IA.api('/api/projects');
-  if (!res) return;
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    IA.toast(IA.formatError(err), 'error');
+// ── Load / render ─────────────────────────────────────────────────────────────
+async function load() {
+  try {
+    projects = await IA.get('/api/projects');
+  } catch (e) {
+    grid.innerHTML = `<div class="empty"><div class="empty-art">${IA.icon('circle-alert')}</div><h3>Couldn't load projects</h3><p>${IA.esc(e.message)}</p></div>`;
     return;
   }
-
-  _projects = await res.json();
-  renderProjects(_projects);
-
-  if (_user.is_admin) {
-    renderGlobalStats(_projects);
-  }
+  render();
 }
 
-function renderProjects(projects) {
-  const grid = document.getElementById('projects-grid');
+const statsOf = (p) => ({ ...p.stats, total: p.image_count });
 
-  if (projects.length === 0) {
-    grid.innerHTML = `
-      <div class="empty-state" style="grid-column: 1 / -1">
-        <div class="empty-state-icon">${_user.is_admin ? '📁' : '📋'}</div>
-        <div class="empty-state-title">${_user.is_admin ? 'No projects yet' : 'No projects assigned'}</div>
-        <div class="empty-state-subtitle">
-          ${_user.is_admin
-            ? 'Click "New Project" to create your first annotation project.'
-            : 'Ask your admin to assign images to you.'}
-        </div>
-        ${_user.is_admin
-          ? `<button class="btn btn-primary" style="margin-top:20px" onclick="openNewProjectModal()">+ New Project</button>`
-          : ''}
-      </div>
-    `;
+function render() {
+  const lead = document.getElementById('home-lead');
+  if (user.is_admin) {
+    const images = projects.reduce((s, p) => s + p.image_count, 0);
+    lead.textContent = projects.length ? `${IA.plural(projects.length, 'project')} · ${IA.plural(images, 'image')}` : 'Create a project to start labelling.';
+    renderTotals();
+  }
+
+  if (!projects.length) {
+    grid.innerHTML = user.is_admin
+      ? `<div class="empty"><div class="empty-art">${IA.icon('folder')}</div><h3>No projects yet</h3>
+           <p>A project holds a set of images, the classes you label them with, and the people doing the work.</p>
+           <button class="btn btn-primary" data-act="new">${IA.icon('plus')}New project</button></div>`
+      : `<div class="empty"><div class="empty-art">${IA.icon('image-off')}</div><h3>Nothing assigned yet</h3>
+           <p>When an admin assigns images to you, the project shows up here.</p></div>`;
     return;
   }
-
-  grid.innerHTML = projects.map(p => buildProjectCard(p)).join('');
+  grid.innerHTML = projects.map(card).join('');
+  IA.lazyFade(grid);
 }
 
-function buildProjectCard(p) {
-  const total      = p.image_count || 0;
-  const annotated  = p.annotated_count || 0;
-  const pct        = total > 0 ? Math.round((annotated / total) * 100) : 0;
-  const classCount = (p.classes || []).length;
-
-  // Build the thumbnail or placeholder
-  const thumbHtml = p.thumbnail_image_id
-    ? `<img src="${IA.imgUrl(p.thumbnail_image_id)}" alt="Project thumbnail" loading="lazy" onerror="this.parentElement.innerHTML=placeholderHtml()">`
-    : `<div class="card-thumb-placeholder">
-         <div class="ph-icon">🗂️</div>
-         <div class="ph-text">No images yet</div>
-       </div>`;
-
-  // Destination URL — admin goes to dashboard, annotator goes to project view
-  const dest = _user.is_admin
-    ? `/projects/${p.id}`
-    : `/projects/${p.id}/view`;
-
-  // Chip: annotated count
-  const annotatedChip = `
-    <span class="card-chip" style="border-color:rgba(255,153,64,0.3);color:var(--orange)">
-      <span class="chip-dot" style="background:var(--orange)"></span>
-      ${annotated} annotated
-    </span>`;
-
-  // Chip: ready count
-  const readyChip = p.ready_count > 0 ? `
-    <span class="card-chip" style="border-color:rgba(34,211,160,0.3);color:var(--green)">
-      <span class="chip-dot" style="background:var(--green)"></span>
-      ${p.ready_count} ready
-    </span>` : '';
-
-  // Chip: class count
-  const classChip = `
-    <span class="card-chip">
-      🏷 ${classCount} class${classCount !== 1 ? 'es' : ''}
-    </span>`;
-
+function card(p, i) {
+  const s = statsOf(p);
+  const pct = p.image_count ? Math.round((p.annotated_count / p.image_count) * 100) : 0;
+  const dest = user.is_admin ? `/projects/${p.id}` : `/projects/${p.id}/view`;
+  const media = p.thumbnail_image_id
+    ? `<img src="${IA.thumbUrl(p.thumbnail_image_id, 640)}" alt="" loading="lazy" onerror="this.remove()"/>`
+    : '';
   return `
-    <div class="project-card" id="card-${p.id}" onclick="openProject('${p.id}', '${dest}')">
-      <div class="card-thumb">
-        ${thumbHtml}
-        <div class="card-cta-overlay">
-          <span class="card-cta-text">Open Project →</span>
+    <a class="project-card rise" style="--i:${i}" href="${dest}" data-id="${p.id}">
+      <div class="pc-media">${media}<div class="ph">${IA.icon('images', 'i-xl')}</div></div>
+      <div class="pc-body">
+        <div class="pc-title-row">
+          <h3 class="pc-title" title="${IA.esc(p.name)}">${IA.esc(p.name)}</h3>
+          ${user.is_admin ? `<button class="btn btn-ghost btn-icon btn-sm" data-act="menu" aria-label="Project actions">${IA.icon('ellipsis')}</button>` : ''}
+        </div>
+        <div class="pc-progress">
+          ${IA.stateBar(s)}
+          <div class="pc-progress-meta"><span><b data-pct>${pct}%</b> annotated</span><span data-counts>${IA.fmtNum(p.annotated_count)} / ${IA.fmtNum(p.image_count)}</span></div>
+        </div>
+        <div class="pc-foot">
+          <span>${IA.plural(p.classes.length, 'class', 'classes')}</span>
+          <span class="sep">·</span>
+          ${p.ready_count ? `<span class="pc-ready">${IA.fmtNum(p.ready_count)} in dataset</span><span class="sep">·</span>` : ''}
+          <span>${IA.esc(IA.fmtDate(p.created_at))}</span>
         </div>
       </div>
-
-      <div class="card-body">
-        <div class="card-title" title="${escHtml(p.name)}">${escHtml(p.name)}</div>
-
-        <div class="card-progress">
-          <div class="card-progress-header">
-            <span class="card-progress-label">${total} images</span>
-            <span class="card-progress-pct" id="pct-${p.id}">${pct}%</span>
-          </div>
-          <div class="progress-bar">
-            <div class="progress-fill" id="prog-${p.id}" style="width:${pct}%"></div>
-          </div>
-        </div>
-
-        <div class="card-chips">
-          ${annotatedChip}
-          ${readyChip}
-          ${classChip}
-        </div>
-      </div>
-
-      <div class="card-footer">
-        <span class="card-created">Created ${IA.fmtDate(p.created_at)}</span>
-        <div style="display:flex; gap:6px; align-items:center;">
-          ${_user.is_admin ? `
-            <button class="card-delete-btn" title="Delete Project" onclick="event.stopPropagation(); confirmDeleteProject('${p.id}', '${escHtml(p.name)}')">
-              🗑️
-            </button>
-          ` : ''}
-          <button class="card-open-btn" onclick="event.stopPropagation(); openProject('${p.id}', '${dest}')">
-            Open →
-          </button>
-        </div>
-      </div>
-    </div>
-  `;
+    </a>`;
 }
 
-function openProject(projectId, dest) {
-  window.location.href = dest;
+function renderTotals() {
+  const sum = (k) => projects.reduce((s, p) => s + (p[k] || 0), 0);
+  const images = sum('image_count'), done = sum('annotated_count');
+  IA.countTo(IA.$('[data-stat="projects"]'), projects.length, { delta: false });
+  IA.countTo(IA.$('[data-stat="images"]'), images);
+  IA.countTo(IA.$('[data-stat="done"]'), done);
+  IA.countTo(IA.$('[data-stat="ready"]'), sum('ready_count'));
+  IA.countTo(IA.$('[data-stat="exported"]'), sum('exported_count'));
+  IA.$('[data-stat="done-pct"]').textContent = images ? `${Math.round((done / images) * 100)}% of all images` : '';
 }
 
-function updateCardStats(projectId, stats) {
-  // Called when we get a stats_update socket event for a specific project
-  const total     = stats.total || 0;
-  const annotated = (stats.annotated || 0) + (stats.ready_for_export || 0) + (stats.exported || 0);
-  const pct       = total > 0 ? Math.round((annotated / total) * 100) : 0;
-
-  const pctEl  = document.getElementById(`pct-${projectId}`);
-  const progEl = document.getElementById(`prog-${projectId}`);
-  if (pctEl)  pctEl.textContent = `${pct}%`;
-  if (progEl) progEl.style.width = `${pct}%`;
-}
-
-function renderGlobalStats(projects) {
-  const totalProjects  = projects.length;
-  const totalImages    = projects.reduce((s, p) => s + (p.image_count || 0), 0);
-  const totalAnnotated = projects.reduce((s, p) => s + (p.annotated_count || 0), 0);
-  const totalExported  = projects.reduce((s, p) => s + (p.exported_count || 0), 0);
-
-  document.getElementById('qs-projects').textContent  = totalProjects;
-  document.getElementById('qs-images').textContent    = totalImages;
-  document.getElementById('qs-annotated').textContent = totalAnnotated;
-  document.getElementById('qs-exported').textContent  = totalExported;
-}
-
-// ── New Project Modal ─────────────────────────────────────────────────────────
-
-function openNewProjectModal() {
-  IA.openModal(
-    'Create New Project',
-    `
-    <div class="new-project-modal-body">
-      <div class="form-group">
-        <label class="form-label" for="np-name">Project name</label>
-        <input class="form-input" id="np-name" placeholder="e.g. Safety Equipment Detection" autofocus/>
-      </div>
-      <div class="form-group">
-        <label class="form-label" for="np-classes">Classes <span style="color:var(--text-muted)">(comma-separated)</span></label>
-        <input class="form-input" id="np-classes" placeholder="helmet, vest, person"/>
-      </div>
-      <div id="np-error" style="display:none;color:var(--red);font-size:12px;margin-top:-4px"></div>
-    </div>
-    `,
-    [
-      { label: 'Cancel',         cls: 'btn-ghost',   fn: IA.closeModal },
-      { label: 'Create Project', cls: 'btn-primary',  fn: submitNewProject },
-    ]
-  );
-
-  // Allow Enter key in modal inputs
-  document.getElementById('np-name').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') submitNewProject();
+/** Live update from the throttled global event (no refetch). */
+function applyStats(projectId, st) {
+  const p = projects.find((x) => x.id === projectId);
+  if (!p) return;
+  const d = IA.derive(st);
+  Object.assign(p, {
+    image_count: d.total, annotated_count: d.done, ready_count: d.ready_for_export,
+    exported_count: d.exported, unassigned_count: d.unassigned, stats: st,
   });
-  document.getElementById('np-classes').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') submitNewProject();
+  const el = grid.querySelector(`.project-card[data-id="${projectId}"]`);
+  if (el) {
+    IA.updateStateBar(el.querySelector('.statebar'), { ...st, total: d.total });
+    el.querySelector('[data-pct]').textContent = `${d.pct}%`;
+    el.querySelector('[data-counts]').textContent = `${IA.fmtNum(d.done)} / ${IA.fmtNum(d.total)}`;
+  }
+  if (user.is_admin) renderTotals();
+}
+
+// ── Interactions ──────────────────────────────────────────────────────────────
+IA.on(grid, 'click', '.project-card', (e, el) => {
+  const act = e.target.closest('[data-act]');
+  if (act?.dataset.act === 'menu') {
+    e.preventDefault();
+    const p = projects.find((x) => x.id === el.dataset.id);
+    IA.menu(act, [
+      { label: 'Open dashboard', icon: 'layout-dashboard', fn: () => { location.href = `/projects/${p.id}`; } },
+      { label: 'Annotate my images', icon: 'pencil', fn: () => { location.href = `/projects/${p.id}/view`; } },
+      'sep',
+      { label: 'Delete project…', icon: 'trash-2', danger: true, fn: () => deleteProject(p) },
+    ]);
+    return;
+  }
+  IA.heroTransition(el.querySelector('.pc-media'));
+});
+IA.on(grid, 'click', '[data-act="new"]', () => newProject());
+document.getElementById('new-project-btn')?.addEventListener('click', () => newProject());
+document.getElementById('history-btn')?.addEventListener('click', () => showHistory());
+
+function newProject() {
+  const m = IA.modal({
+    title: 'New project',
+    sub: 'You can import images and change classes later.',
+    body: `
+      <div class="field"><label for="np-name">Name</label><input class="input" id="np-name" placeholder="e.g. Site safety — helmets" autofocus/></div>
+      <div class="field"><label for="np-classes">Classes</label><input class="input" id="np-classes" placeholder="helmet, vest, person"/>
+        <span class="hint">Comma-separated. Order sets the YOLO class ids.</span></div>
+      <div class="error" id="np-error"></div>`,
+    actions: [
+      { label: 'Cancel', variant: 'btn-ghost' },
+      { id: 'create', label: 'Create project', variant: 'btn-primary', fn: async () => {
+        const name = m.body.querySelector('#np-name').value.trim();
+        const classes = m.body.querySelector('#np-classes').value.split(',').map((c) => c.trim()).filter(Boolean);
+        const errEl = m.body.querySelector('#np-error');
+        if (name.length < 2) { errEl.textContent = 'Give the project a name (at least 2 characters).'; return false; }
+        if (!classes.length) { errEl.textContent = 'Add at least one class.'; return false; }
+        try {
+          const p = await IA.post('/api/projects', { name, classes });
+          location.href = `/projects/${p.id}#import`;
+        } catch (e) { errEl.textContent = e.message; return false; }
+        return true;
+      } },
+    ],
   });
+  m.body.querySelectorAll('input').forEach((inp) => inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') m.actions.create.click(); }));
 }
 
-async function submitNewProject() {
-  const name    = (document.getElementById('np-name').value || '').trim();
-  const rawCls  = (document.getElementById('np-classes').value || '').trim();
-  const errEl   = document.getElementById('np-error');
-
-  errEl.style.display = 'none';
-
-  if (!name) {
-    errEl.textContent = 'Project name is required.';
-    errEl.style.display = 'block';
-    document.getElementById('np-name').focus();
-    return;
-  }
-
-  const classes = rawCls.split(',').map(c => c.trim()).filter(Boolean);
-  if (classes.length === 0) {
-    errEl.textContent = 'At least one class is required.';
-    errEl.style.display = 'block';
-    document.getElementById('np-classes').focus();
-    return;
-  }
-
-  // Disable button to prevent double-submit
-  const modalActions = document.getElementById('modal-actions');
-  const createBtn = modalActions ? modalActions.lastElementChild : null;
-  if (createBtn) { createBtn.disabled = true; createBtn.textContent = 'Creating…'; }
-
-  const res = await IA.api('/api/projects', {
-    method: 'POST',
-    body: JSON.stringify({ name, classes }),
+async function deleteProject(p) {
+  const ok = await IA.confirm({
+    title: `Delete “${p.name}”?`,
+    html: `<div class="callout danger">${IA.icon('circle-alert')}<div>Removes all ${IA.plural(p.image_count, 'image')} from the project, with their annotations and assignments, plus any frames this app extracted from videos. Original image folders and exported datasets are not touched.</div></div>`,
+    confirmLabel: 'Delete project', danger: true, requireText: p.name,
   });
-
-  if (!res) return;
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    errEl.textContent = IA.formatError(err);
-    errEl.style.display = 'block';
-    if (createBtn) { createBtn.disabled = false; createBtn.textContent = 'Create Project'; }
-    return;
-  }
-
-  const project = await res.json();
-  IA.closeModal();
-  IA.toast(`Project "${project.name}" created!`, 'success');
-
-  // Admins go directly to the new project's dashboard
-  setTimeout(() => {
-    window.location.href = `/projects/${project.id}`;
-  }, 600);
+  if (!ok) return;
+  try {
+    await IA.del(`/api/projects/${p.id}`);
+    IA.toast(`Deleted “${p.name}”`, 'success');
+    await load();
+  } catch (e) { IA.toast(e.message, 'error'); }
 }
 
-// ── Utility ───────────────────────────────────────────────────────────────────
-
-function placeholderHtml() {
-  return `<div class="card-thumb-placeholder">
-    <div class="ph-icon">🖼️</div>
-    <div class="ph-text">Image unavailable</div>
-  </div>`;
+async function showHistory() {
+  const m = IA.modal({ title: 'Project history', size: 'wide', body: '<div class="row"><span class="spinner"></span><span class="muted">Loading…</span></div>' });
+  try {
+    const rows = await IA.get('/api/projects/history');
+    m.body.innerHTML = rows.length ? `
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>Project</th><th>Status</th><th>Created</th><th class="num">Images</th><th>Deleted</th></tr></thead>
+        <tbody>${rows.map((r) => `<tr>
+          <td class="strong">${IA.esc(r.name)}</td>
+          <td>${r.date_deleted ? '<span class="chip danger">Deleted</span>' : '<span class="chip success">Active</span>'}</td>
+          <td>${IA.esc(IA.fmtDate(r.date_created))}</td>
+          <td class="num">${IA.fmtNum(r.dataset_size)}</td>
+          <td class="muted">${r.date_deleted ? IA.esc(IA.fmtDate(r.date_deleted)) : '—'}</td></tr>`).join('')}</tbody>
+      </table></div>` : '<p class="muted">No projects yet.</p>';
+  } catch (e) { m.body.innerHTML = `<div class="callout danger">${IA.esc(e.message)}</div>`; }
 }
 
-function escHtml(str) {
-  const div = document.createElement('div');
-  div.appendChild(document.createTextNode(str || ''));
-  return div.innerHTML;
-}
+// ── Live updates ──────────────────────────────────────────────────────────────
+const socket = IA.connectSocket();
+socket?.on('projects_changed', IA.debounce(load, 300));
+socket?.on('project_stats_changed', ({ project_id, stats }) => applyStats(project_id, stats));
 
-// ── Project History & Deletion Modals ────────────────────────────────────────
-
-async function openProjectHistoryModal() {
-  const modalBox = document.getElementById('modal-box');
-  if (modalBox) modalBox.classList.add('modal-wide');
-
-  IA.openModal(
-    'Project History Log',
-    `<div class="text-muted text-sm" style="text-align:center; padding: 20px;">Loading history log…</div>`,
-    [
-      { label: 'Close', cls: 'btn-ghost', fn: closeProjectHistoryModal }
-    ]
-  );
-
-  const res = await IA.api('/api/projects/history');
-  if (!res) return;
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    document.getElementById('modal-body').innerHTML = `
-      <div style="color:var(--red); font-size:13px; text-align:center; padding:20px;">
-        Failed to load history: ${IA.formatError(err)}
-      </div>
-    `;
-    return;
-  }
-
-  const history = await res.json();
-  if (history.length === 0) {
-    document.getElementById('modal-body').innerHTML = `
-      <div class="text-muted text-sm" style="text-align:center; padding: 20px;">
-        No project history found.
-      </div>
-    `;
-    return;
-  }
-
-  const tableRows = history.map(item => {
-    const isDeleted = !!item.date_deleted;
-    const statusBadge = isDeleted 
-      ? `<span class="badge" style="background:var(--red-d); color:var(--red);">Deleted</span>` 
-      : `<span class="badge" style="background:var(--green-d); color:var(--green);">Active</span>`;
-    
-    const createdStr = IA.fmtDate(item.date_created);
-    const deletedStr = isDeleted ? IA.fmtDate(item.date_deleted) : '<span style="color:var(--text-muted); font-style:italic;">—</span>';
-    
-    return `
-      <tr class="${isDeleted ? 'history-deleted-row' : ''}">
-        <td>${statusBadge}</td>
-        <td style="font-weight:600; color:var(--text-primary);" title="${escHtml(item.name)}">${escHtml(item.name)}</td>
-        <td>${createdStr}</td>
-        <td style="font-variant-numeric: tabular-nums;">${item.dataset_size} frame${item.dataset_size !== 1 ? 's' : ''}</td>
-        <td>${deletedStr}</td>
-      </tr>
-    `;
-  }).join('');
-
-  document.getElementById('modal-body').innerHTML = `
-    <div class="history-table-container">
-      <table class="history-table">
-        <thead>
-          <tr>
-            <th>Status</th>
-            <th>Project Name</th>
-            <th>Created At</th>
-            <th>Size</th>
-            <th>Deleted At</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${tableRows}
-        </tbody>
-      </table>
-    </div>
-  `;
-}
-
-function closeProjectHistoryModal() {
-  const modalBox = document.getElementById('modal-box');
-  if (modalBox) modalBox.classList.remove('modal-wide');
-  IA.closeModal();
-}
-
-async function confirmDeleteProject(projectId, projectName) {
-  IA.openModal(
-    'Delete Project',
-    `
-    <div style="display:flex; flex-direction:column; gap:12px; min-width:320px;">
-      <p style="color:var(--text-secondary); font-size:13px; line-height:1.5;">
-        Are you sure you want to delete the project <strong>"${escHtml(projectName)}"</strong>?
-      </p>
-      <div style="background:rgba(255, 95, 126, 0.08); border-left: 3px solid var(--red); padding: 10px 12px; border-radius: var(--radius-sm); font-size: 12.5px; color: var(--red); line-height:1.5;">
-        ⚠️ This will cascade delete all images, annotations, assignments, and extracted video frames.
-        <br/>
-        <strong>Exported YOLO datasets will NOT be deleted.</strong>
-      </div>
-      <div class="form-group" style="margin-top:8px;">
-        <label class="form-label" style="font-size:11px; text-transform:none;">
-          To confirm, type the project name below:
-        </label>
-        <input class="form-input" id="confirm-delete-name" placeholder="${escHtml(projectName)}" autocomplete="off" style="margin-top:4px;"/>
-      </div>
-      <div id="delete-error" style="display:none; color:var(--red); font-size:12px; margin-top:4px;"></div>
-    </div>
-    `,
-    [
-      { label: 'Cancel', cls: 'btn-ghost', fn: IA.closeModal },
-      { label: 'Delete Project', cls: 'btn-danger', fn: () => submitDeleteProject(projectId, projectName) }
-    ]
-  );
-
-  setTimeout(() => {
-    const input = document.getElementById('confirm-delete-name');
-    if (input) {
-      input.focus();
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') submitDeleteProject(projectId, projectName);
-      });
-    }
-  }, 100);
-}
-
-async function submitDeleteProject(projectId, projectName) {
-  const inputVal = (document.getElementById('confirm-delete-name').value || '').trim();
-  const errEl = document.getElementById('delete-error');
-  if (!errEl) return;
-  errEl.style.display = 'none';
-
-  if (inputVal !== projectName) {
-    errEl.textContent = 'Project name does not match.';
-    errEl.style.display = 'block';
-    return;
-  }
-
-  // Disable submit button
-  const modalActions = document.getElementById('modal-actions');
-  const deleteBtn = modalActions ? modalActions.lastElementChild : null;
-  if (deleteBtn) {
-    deleteBtn.disabled = true;
-    deleteBtn.textContent = 'Deleting…';
-  }
-
-  const res = await IA.api(`/api/projects/${projectId}`, {
-    method: 'DELETE'
-  });
-
-  if (!res) return;
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    errEl.textContent = IA.formatError(err);
-    errEl.style.display = 'block';
-    if (deleteBtn) {
-      deleteBtn.disabled = false;
-      deleteBtn.textContent = 'Delete Project';
-    }
-    return;
-  }
-
-  IA.closeModal();
-  IA.toast(`Project "${projectName}" successfully deleted.`, 'success');
-  await loadProjects();
-}
+await load();
+})();

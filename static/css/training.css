@@ -1,3 +1,16 @@
+/* ── Shared-shell compatibility (classes this page used from the old main.css) ── */
+.btn-secondary { --btn-bg: var(--bg-2); }
+.form-input, .form-select { width: 100%; height: 34px; padding: 0 10px; background: var(--bg-2); color: var(--fg-0);
+  border: 1px solid var(--line-strong); border-radius: var(--r-md); font-size: var(--fs-base); }
+.form-input:focus, .form-select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.form-label { font-size: var(--fs-sm); font-weight: 500; color: var(--fg-1); }
+.text-sm { font-size: var(--fs-sm); }
+.text-muted { color: var(--fg-2); }
+.progress-bar { height: 4px; background: var(--bg-3); border-radius: var(--r-full); overflow: hidden; }
+.progress-fill { height: 100%; background: var(--accent); border-radius: inherit; transition: width var(--d-slow) var(--ease-out); }
+.training-root .i { width: 15px; height: 15px; }
+.saved-model-row .i { color: var(--fg-2); }
+
 /* ═══════════════════════════════════════════════════════════════════
    Training Page — training.css
    Dark ML training UI · Ring gauges · Sparkline charts · Terminal
@@ -5,8 +18,7 @@
 
 /* ── Page root layout ─────────────────────────────────────────────── */
 .training-root {
-  margin-top: 56px;          /* clear fixed topbar */
-  min-height: calc(100vh - 56px);
+  min-height: calc(100vh - var(--top-h));
   display: flex;
   flex-direction: column;
   padding-bottom: 40px;
@@ -130,10 +142,10 @@
   border-radius: 3px;
   transition: width 0.5s ease;
 }
-.hw-bar-cpu  { background: linear-gradient(90deg, #4f9eff, #7cb8ff); }
-.hw-bar-ram  { background: linear-gradient(90deg, #7c6dff, #9d92ff); }
-.hw-bar-gpu  { background: linear-gradient(90deg, #22d3a0, #4eebc0); }
-.hw-bar-vram { background: linear-gradient(90deg, #ff9940, #ffb870); }
+.hw-bar-cpu  { background: #4f9eff; }
+.hw-bar-ram  { background: #7c6dff; }
+.hw-bar-gpu  { background: #22d3a0; }
+.hw-bar-vram { background: #ff9940; }
 .hw-bar-sub {
   font-size: 10px;
   color: var(--text-muted);
@@ -143,7 +155,7 @@
 
 /* ── Training Status Banner (during training) ─────────────────────── */
 .train-status-banner {
-  background: linear-gradient(90deg, rgba(34,211,160,0.08) 0%, rgba(124,109,255,0.08) 100%);
+  background: rgba(34,211,160,0.08);
   border-bottom: 1px solid rgba(34,211,160,0.2);
   padding: 10px 24px;
   display: flex;
@@ -192,7 +204,7 @@
 }
 .epoch-progress-bar .ep-fill {
   height: 100%;
-  background: linear-gradient(90deg, var(--green), var(--accent));
+  background: var(--green);
   border-radius: 3px;
   transition: width 0.5s ease;
 }
@@ -363,7 +375,7 @@
 .model-card.selected {
   border-color: var(--accent);
   background: var(--accent-dim);
-  box-shadow: 0 0 0 1px var(--accent), 0 4px 24px var(--accent-glow);
+  box-shadow: 0 0 0 1px var(--accent);
 }
 .model-card::before {
   content: '';
@@ -506,7 +518,7 @@
   padding: 14px 48px;
   font-size: 16px;
   font-weight: 700;
-  background: linear-gradient(135deg, var(--accent) 0%, var(--green) 100%);
+  background: var(--accent);
   color: #fff;
   border: none;
   border-radius: var(--radius-lg);
@@ -522,7 +534,7 @@
 .btn-launch::before {
   content: '';
   position: absolute; inset: 0;
-  background: linear-gradient(135deg, rgba(255,255,255,0.15) 0%, transparent 60%);
+  background: rgba(255,255,255,0.15);
 }
 .btn-launch:hover {
   transform: translateY(-2px);
@@ -536,7 +548,7 @@
   box-shadow: none;
 }
 .btn-launch.training {
-  background: linear-gradient(135deg, #ff5f7e 0%, #ff9940 100%);
+  background: #ff5f7e;
 }
 .btn-launch.training:hover { box-shadow: 0 8px 32px rgba(255,95,126,0.4); }
 
@@ -775,7 +787,7 @@
 .btn-stop-panel {
   width: 100%;
   padding: 10px;
-  background: linear-gradient(135deg, rgba(255,95,126,0.15) 0%, rgba(255,95,126,0.08) 100%);
+  background: rgba(255,95,126,0.15);
   border: 1px solid rgba(255,95,126,0.35);
   border-radius: var(--radius);
   color: var(--red);
@@ -790,7 +802,7 @@
   letter-spacing: 0.01em;
 }
 .btn-stop-panel:hover {
-  background: linear-gradient(135deg, rgba(255,95,126,0.25) 0%, rgba(255,95,126,0.15) 100%);
+  background: rgba(255,95,126,0.25);
   border-color: var(--red);
   box-shadow: 0 4px 16px rgba(255,95,126,0.25);
   transform: translateY(-1px);
@@ -1167,15 +1179,15 @@
 }
 .mem-capacity-bar {
   height: 100%;
-  background: linear-gradient(90deg, var(--accent), var(--green));
+  background: var(--accent);
   border-radius: 2px;
   transition: width 0.3s ease;
 }
 .mem-capacity-bar.warn {
-  background: linear-gradient(90deg, var(--yellow), var(--orange));
+  background: var(--yellow);
 }
 .mem-capacity-bar.danger {
-  background: linear-gradient(90deg, var(--orange), var(--red));
+  background: var(--orange);
 }
 .mem-slider-hint {
   font-size: 10px;
@@ -1196,7 +1208,7 @@
 }
 .rec-card-header {
   padding: 12px 20px;
-  background: linear-gradient(90deg, rgba(245,190,80,0.08) 0%, rgba(124,109,255,0.06) 100%);
+  background: rgba(245,190,80,0.08);
   border-bottom: 1px solid rgba(245,190,80,0.15);
   font-size: 13px;
   font-weight: 700;
@@ -1288,7 +1300,7 @@
 
 /* Amber button (apply recommendation) */
 .btn-amber {
-  background: linear-gradient(135deg, rgba(245,190,80,0.2) 0%, rgba(245,190,80,0.1) 100%);
+  background: rgba(245,190,80,0.2);
   color: #f5be50;
   border: 1px solid rgba(245,190,80,0.35);
   font-weight: 700;
@@ -1507,3 +1519,20 @@
   border: 1px solid rgba(124,109,255,0.2);
   border-radius: var(--radius-sm);
 }
+
+/* ── Run history ─────────────────────────────────────────────────── */
+.runs-list { display: grid; gap: 8px; }
+.run-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg-1); }
+.run-row .run-name { font-size: 13px; font-weight: 600; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-row .run-meta { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 4px; font-size: 12px; color: var(--text-muted); }
+.run-row .run-meta b { color: var(--text-primary); font-weight: 600; }
+.run-actions { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+.run-badge { display: inline-flex; align-items: center; height: 18px; padding: 0 7px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line-strong); color: var(--text-secondary); margin-left: 6px; vertical-align: 1px; }
+.run-badge.cloud { color: #cfe1ff; border-color: var(--accent-line); background: var(--accent-soft); }
+.run-badge.error, .run-badge.interrupted { color: #f8a3a6; border-color: rgb(242 85 90 / 0.35); }
+.run-badge.running { color: #9be6c3; border-color: rgb(62 207 142 / 0.35); }
+.plot-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
+.plot-grid figure { margin: 0; }
+.plot-grid img { width: 100%; border-radius: 6px; border: 1px solid var(--line); background: #fff; }
+.plot-grid figcaption { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+

@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}Account{% endblock %}
+{% block content %}
+<main class="page" style="max-width: 640px">
+  <div class="page-head">
+    <div>
+      <div class="eyebrow">Account</div>
+      <h1 id="acc-title">Change password</h1>
+      <p id="acc-lead">Choose a new password for <b id="acc-user"></b>.</p>
+    </div>
+  </div>
+
+  <div class="callout warn hidden" id="first-note" style="margin-bottom: 16px">
+    <svg class="i" aria-hidden="true"><use href="/static/icons/sprite.svg#i-shield"/></svg>
+    <div>This account still uses its default password. Set your own before continuing — anyone on the network could otherwise sign in as you.</div>
+  </div>
+
+  <form class="panel" id="pw-form" novalidate>
+    <div class="panel-body stack">
+      <div class="field">
+        <label for="cur">Current password</label>
+        <input class="input" id="cur" type="password" autocomplete="current-password" required/>
+      </div>
+      <div class="field">
+        <label for="new">New password</label>
+        <input class="input" id="new" type="password" autocomplete="new-password" minlength="6" required/>
+        <span class="hint">At least 6 characters.</span>
+      </div>
+      <div class="field">
+        <label for="new2">Repeat new password</label>
+        <input class="input" id="new2" type="password" autocomplete="new-password" required/>
+      </div>
+      <div class="callout danger hidden" id="pw-error" role="alert"></div>
+    </div>
+    <div class="panel-foot">
+      <button class="btn btn-primary" type="submit" id="pw-save">Update password</button>
+    </div>
+  </form>
+</main>
+{% endblock %}
+{% block scripts %}
+<script>
+(async () => {
+  const user = await IA.shell({ section: 'account' });
+  if (!user) return;
+  IA.setCrumbs([{ label: 'Account' }]);
+  IA.connectSocket();
+  document.getElementById('acc-user').textContent = user.username;
+  const first = new URLSearchParams(location.search).get('first') || user.must_change_password;
+  if (first) document.getElementById('first-note').classList.remove('hidden');
+
+  const form = document.getElementById('pw-form');
+  const err = document.getElementById('pw-error');
+  const showErr = (m) => { err.textContent = m; err.classList.toggle('hidden', !m); };
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    showErr('');
+    const cur = form.cur.value, nw = form.new.value, nw2 = form.new2.value;
+    if (nw.length < 8) return showErr('The new password must be at least 8 characters.');
+    if (nw !== nw2) return showErr('The two new passwords do not match.');
+    await IA.busy(document.getElementById('pw-save'), async () => {
+      try {
+        // Other sessions are signed out; this tab continues with the fresh token
+        const data = await IA.patch('/api/auth/me/password', { current_password: cur, new_password: nw });
+        IA.setSession(data);
+        IA.toast('Password updated — other devices were signed out', 'success');
+        form.reset();
+        if (first) setTimeout(() => { location.href = '/home'; }, 600);
+      } catch (ex) { showErr(IA.formatError(ex)); }
+    });
+  });
+})();
+</script>
+{% endblock %}

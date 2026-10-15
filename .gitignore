@@ -127,3 +127,10 @@ $RECYCLE.BIN/
 tmp/
 temp/
 *.tmp
+
+# Local dev launch config (machine-specific paths)
+.claude/launch.json
+
+# Invictus runtime folders (2.2)
+data/
+model_cache/

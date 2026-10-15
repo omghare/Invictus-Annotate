@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% from "_brand.html" import icon %}
+{% block title %}Users{% endblock %}
+{% block content %}
+<main class="page" style="max-width: 980px">
+  <div class="page-head">
+    <div>
+      <div class="eyebrow">Workspace</div>
+      <h1>Users</h1>
+      <p>Everyone who can sign in. Annotators only see projects with images assigned to them.</p>
+    </div>
+    <div class="page-actions"><button class="btn btn-primary" id="add-user">{{ icon('user-plus') }}Add user</button></div>
+  </div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>User</th><th>Role</th><th>Added</th><th class="actions"></th></tr></thead>
+      <tbody id="users-body"><tr><td colspan="4"><span class="spinner"></span></td></tr></tbody>
+    </table>
+  </div>
+  <p class="small muted" style="margin-top: 12px">Deleting a user keeps the work they finished; their unfinished images go back to the unassigned pool.</p>
+</main>
+{% endblock %}
+{% block scripts %}
+<script>
+(async () => {
+  const me = await IA.shell({ adminOnly: true, section: 'users' });
+  if (!me) return;
+  IA.setCrumbs([{ label: 'Users' }]);
+  IA.connectSocket();
+  const body = document.getElementById('users-body');
+  let users = [];
+
+  async function load() {
+    try { users = await IA.get('/api/users'); } catch (e) { body.innerHTML = `<tr><td colspan="4">${IA.esc(e.message)}</td></tr>`; return; }
+    body.innerHTML = users.map((u) => `
+      <tr data-id="${u.id}">
+        <td class="strong"><div class="row" style="flex-wrap:nowrap">${IA.avatar(u.username)}<span>${IA.esc(u.username)}${u.id === me.id ? ' <span class="muted small">(you)</span>' : ''}</span></div></td>
+        <td>${u.is_admin ? '<span class="chip accent">Admin</span>' : '<span class="chip">Annotator</span>'}</td>
+        <td class="muted">${IA.esc(IA.fmtDate(u.created_at))}</td>
+        <td class="actions">
+          <button class="btn btn-ghost btn-sm" data-act="pw">${IA.icon('key-round')}Reset password</button>
+          ${u.id !== me.id ? `<button class="btn btn-ghost btn-sm" data-act="del">${IA.icon('trash-2')}Delete</button>` : ''}
+        </td>
+      </tr>`).join('');
+  }
+
+  IA.on(body, 'click', '[data-act]', async (e, btn) => {
+    const u = users.find((x) => x.id === btn.closest('tr').dataset.id);
+    if (btn.dataset.act === 'pw') {
+      const pw = await IA.prompt({ title: `Temporary password for ${u.username}`, label: 'They are signed out and must choose their own password at next sign-in', type: 'password', confirmLabel: 'Set password',
+        validate: (v) => (v.length < 8 ? 'At least 8 characters' : '') });
+      if (pw === null) return;
+      try { await IA.patch(`/api/users/${u.id}/password`, { password: pw }); IA.toast(`Temporary password set for ${u.username}`, 'success'); }
+      catch (err) { IA.toast(err.message, 'error'); }
+    } else if (btn.dataset.act === 'del') {
+      const ok = await IA.confirm({ title: `Delete ${u.username}?`, message: 'They can no longer sign in. Images they annotated keep their annotations; images they had not finished go back to the unassigned pool.', confirmLabel: 'Delete user', danger: true });
+      if (!ok) return;
+      try { await IA.del(`/api/users/${u.id}`); IA.toast(`Deleted ${u.username}`, 'success'); load(); }
+      catch (err) { IA.toast(err.message, 'error'); }
+    }
+  });
+
+  document.getElementById('add-user').addEventListener('click', () => {
+    const m = IA.modal({
+      title: 'Add user',
+      body: `
+        <div class="field"><label for="nu-name">Username</label><input class="input" id="nu-name" autocomplete="off" autofocus/></div>
+        <div class="field"><label for="nu-pw">Password</label><input class="input" id="nu-pw" type="password" autocomplete="new-password"/><span class="hint">Share it with them; they can change it under Account.</span></div>
+        <div class="field"><label>Role</label><div class="stack" style="gap:8px">
+          <label class="choice"><input type="radio" name="nu-role" value="0" checked/><div><b>Annotator</b><span>Labels the images assigned to them.</span></div></label>
+          <label class="choice"><input type="radio" name="nu-role" value="1"/><div><b>Admin</b><span>Manages projects, users, exports and training.</span></div></label>
+        </div></div>
+        <div class="error" id="nu-err"></div>`,
+      actions: [
+        { label: 'Cancel', variant: 'btn-ghost' },
+        { id: 'ok', label: 'Create user', variant: 'btn-primary', fn: async () => {
+          const username = m.body.querySelector('#nu-name').value.trim();
+          const password = m.body.querySelector('#nu-pw').value;
+          const is_admin = m.body.querySelector('input[name="nu-role"]:checked').value === '1';
+          try { await IA.post('/api/users', { username, password, is_admin }); IA.toast(`Created ${username}`, 'success'); load(); }
+          catch (err) { m.body.querySelector('#nu-err').textContent = err.message; return false; }
+          return true;
+        } },
+      ],
+    });
+    m.body.querySelectorAll('input').forEach((i) => i.addEventListener('keydown', (e) => { if (e.key === 'Enter') m.actions.ok.click(); }));
+  });
+
+  load();
+})();
+</script>
+{% endblock %}

@@ -1,31 +1,8 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Train Model — Invictus Annotate</title>
-  <meta name="description" content="Train YOLO object detection models on your annotated datasets with real-time monitoring."/>
-  <link rel="stylesheet" href="/static/css/main.css"/>
-  <link rel="stylesheet" href="/static/css/training.css?v=3.0.0"/>
-</head>
-<body>
-
-  <!-- ── Topbar ─────────────────────────────────────────────────────── -->
-  <header class="topbar">
-    <div class="topbar-brand">
-      <div class="logo-dot"></div>
-      Invictus Annotate
-      <span style="font-size:10px;background:rgba(34,211,160,0.15);color:var(--green);padding:2px 7px;border-radius:100px;font-weight:600">TRAIN</span>
-    </div>
-    <div class="topbar-spacer"></div>
-    <div class="conn-indicator">
-      <div class="conn-dot" id="conn-dot"></div>
-      <span id="conn-label">Connecting</span>
-    </div>
-    <a href="javascript:history.back()" class="btn btn-ghost btn-sm">← Back</a>
-    <button class="btn btn-ghost btn-sm" onclick="IA.logout()">Sign out</button>
-  </header>
-
+{% extends "base.html" %}
+{% from "_brand.html" import icon %}
+{% block title %}Train model{% endblock %}
+{% block head %}<link rel="stylesheet" href="{{ asset('css/training.css') }}"/>{% endblock %}
+{% block content %}
   <div class="training-root">
 
     <!-- ── System Info Banner ──────────────────────────────────────── -->
@@ -84,7 +61,7 @@
         <span style="color:var(--text-muted);font-size:10px">ETA</span>
         <span id="train-eta-val" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent-light)">—</span>
       </div>
-      <button class="btn btn-danger btn-sm" id="btn-stop" onclick="confirmStop()">&#9209; Stop Training</button>
+      <button class="btn btn-danger btn-sm" id="btn-stop" onclick="confirmStop()">{{ icon('octagon-x') }}Stop training</button>
     </div>
 
     <!-- ── Main content ────────────────────────────────────────────── -->
@@ -109,7 +86,7 @@
             <div class="dataset-pick-row">
               <input class="form-input" id="dataset-path-input" placeholder="e.g. D:\Invictus_Annotate\dataset\MyProject_dataset"
                 oninput="onDatasetPathInput()" style="flex:1;min-width:260px"/>
-              <button class="btn btn-primary" onclick="pickDatasetFolder()">&#128193; Browse…</button>
+              <button class="btn btn-primary" onclick="pickDatasetFolder()">{{ icon('folder-open') }}Browse…</button>
               <button class="btn btn-secondary" onclick="validateCurrentPath()" id="btn-validate">Validate</button>
             </div>
 
@@ -118,9 +95,9 @@
               <div class="dataset-info-grid" id="splits-grid"></div>
 
               <div class="yaml-info-row" id="yaml-info-row">
-                <span id="yaml-status-icon">&#128196;</span>
+                <span id="yaml-status-icon">{{ icon('info') }}</span>
                 <span id="yaml-status-text" style="font-weight:600;font-size:13px"></span>
-                <input class="form-input" id="yaml-path-input" placeholder="Path to data.yaml…" style="flex:1;min-width:200px"/>
+                <input class="form-input" id="yaml-path-input" oninput="checkLaunchReady()" placeholder="Path to data.yaml…" style="flex:1;min-width:200px"/>
                 <button class="btn btn-secondary btn-sm" onclick="pickYamlFile()" id="btn-pick-yaml">Browse…</button>
               </div>
 
@@ -128,7 +105,7 @@
 
               <!-- Dataset Intelligence Panel -->
               <div class="dataset-intel hidden" id="dataset-intel">
-                <div class="intel-header">&#128202; Dataset Intelligence</div>
+                <div class="intel-header">{{ icon('activity') }} Dataset overview</div>
                 <div class="intel-stats-row" id="intel-stats-row"></div>
                 <div class="intel-split-bar-wrap hidden" id="intel-split-bar-wrap"></div>
                 <div class="intel-classes-row hidden" id="intel-classes-row"></div>
@@ -137,7 +114,7 @@
               <!-- System Capabilities + Memory Allocation -->
               <div class="sys-detail-panel hidden" id="sys-detail-panel">
                 <div class="sys-detail-header">
-                  <span>&#128421; System Capabilities</span>
+                  <span>{{ icon('monitor') }} System</span>
                   <span class="sys-mode-badge" id="sys-mode-badge">CPU Mode</span>
                 </div>
                 <div class="sys-detail-grid" id="sys-detail-grid"></div>
@@ -163,14 +140,14 @@
         <!-- AI Recommendation Card -->
         <div class="rec-card hidden" id="rec-card">
           <div class="rec-card-header">
-            <span>&#10024; AI Recommendation</span>
+            <span>{{ icon('sparkle') }} Suggested settings</span>
             <span class="rec-confidence-badge" id="rec-confidence-badge">Optimal</span>
           </div>
           <div class="rec-summary" id="rec-summary"></div>
           <div class="rec-fields-grid" id="rec-fields-grid"></div>
           <div class="rec-card-actions">
             <button class="btn btn-amber btn-sm" id="btn-apply-model" onclick="applyModelRecommendation()">
-              &#128161; Apply Recommended Model
+              Apply suggested model
             </button>
             <button class="btn btn-secondary btn-sm" id="btn-apply-params" onclick="applyParamRecommendations()" disabled>
               Apply Recommended Params
@@ -199,8 +176,8 @@
             <div class="model-card-grid" id="grid-v11"></div>
 
             <div style="margin-top:16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-              <span style="font-size:12px;color:var(--text-muted);font-weight:600">Custom model path / name:</span>
-              <input class="form-input" id="custom-model-input" placeholder="e.g. yolov8n.pt or D:\models\custom.pt"
+              <span style="font-size:12px;color:var(--text-muted);font-weight:600">Or continue from a model you trained:</span>
+              <input class="form-input" id="custom-model-input" placeholder="e.g. MyRun_yolo11n_2026…/best.pt (see the run history below)"
                 style="flex:1;min-width:200px" oninput="onCustomModelInput()"/>
             </div>
           </div>
@@ -214,9 +191,9 @@
             <div style="flex:1"></div>
             <div class="preset-row" style="margin:0">
               <label>Preset:</label>
-              <button class="btn btn-secondary btn-sm" onclick="loadPreset('fast')">&#9889; Fast CPU Test</button>
-              <button class="btn btn-secondary btn-sm" onclick="loadPreset('optimal')">&#127919; Optimal CPU (416px)</button>
-              <button class="btn btn-secondary btn-sm" onclick="loadPreset('highres')">&#128301; Standard CPU (640px)</button>
+              <button class="btn btn-secondary btn-sm" onclick="loadPreset('fast')">Quick test</button>
+              <button class="btn btn-secondary btn-sm" onclick="loadPreset('optimal')">Balanced (416 px)</button>
+              <button class="btn btn-secondary btn-sm" onclick="loadPreset('highres')">Standard (640 px)</button>
             </div>
           </div>
           <div class="step-body">
@@ -290,11 +267,11 @@
               </div>
               <div class="param-group">
                 <label class="param-label">
-                  Device <span class="param-hint" data-tip="cpu = CPU training, 0 = GPU 0">?</span>
+                  Device <span class="param-hint" data-tip="auto = the GPU when one is available, else CPU · cpu · 0 = first GPU">?</span>
                   <span class="param-ai-dot hidden" id="ai-dot-device">&#9733;</span>
                   <span class="param-custom-dot hidden" id="custom-dot-device">&#9998;</span>
                 </label>
-                <input class="form-input" id="p-device" value="cpu" placeholder="cpu" oninput="onParamChange('device')"/>
+                <input class="form-input" id="p-device" value="auto" placeholder="auto · cpu · 0" oninput="onParamChange('device')"/>
               </div>
             </div>
 
@@ -331,7 +308,7 @@
         <!-- Warning Box (auto-appears above launch button) -->
         <div class="warning-box hidden" id="warning-box">
           <div class="warning-box-header">
-            <span>&#9888; Training Parameter Warnings</span>
+            <span>{{ icon('circle-alert') }} Parameter warnings</span>
             <span class="warning-count-badge" id="warning-count-badge">0</span>
           </div>
           <div class="warning-box-body" id="warning-box-body"></div>
@@ -347,7 +324,7 @@
             <input class="form-input run-name-input" id="run-name-input" placeholder="Auto-generated if blank"/>
           </div>
           <button class="btn-launch" id="btn-launch" onclick="beginTraining()" disabled>
-            &#128640; Begin Training
+            Begin training
           </button>
           <div style="font-size:12px;color:var(--text-muted);text-align:center;max-width:300px" id="launch-hint">
             Select a dataset and model to enable training
@@ -379,7 +356,7 @@
         <div class="stats-panel">
 
           <div class="stats-card">
-            <div class="stats-card-header">&#128200; Epoch Progress</div>
+            <div class="stats-card-header">{{ icon('activity') }} Epoch progress</div>
             <div class="stats-card-body">
               <div class="epoch-counter" style="display:flex;justify-content:space-between;align-items:flex-end;">
                 <div style="display:flex;align-items:baseline;gap:6px;">
@@ -473,7 +450,7 @@
           </div>
 
           <div class="stats-card">
-            <div class="stats-card-header">&#128421; Hardware Usage</div>
+            <div class="stats-card-header">{{ icon('cpu') }} Hardware</div>
             <div class="stats-card-body" style="padding:10px 14px">
               <div class="hw-bar-gauges" id="hw-gauges">
                 <div class="hw-bar-row">
@@ -502,13 +479,13 @@
 
           <div class="stats-card stats-stop-card hidden" id="stats-stop-card">
             <div class="stats-card-body" style="padding:10px 14px">
-              <button class="btn-stop-panel" id="btn-stop-panel" onclick="confirmStop()">&#9209; Stop Training</button>
+              <button class="btn-stop-panel" id="btn-stop-panel" onclick="confirmStop()">{{ icon('octagon-x') }}Stop training</button>
               <div style="font-size:10px;color:var(--text-muted);text-align:center;margin-top:6px">Current best weights will be preserved</div>
             </div>
           </div>
 
           <div class="stats-card commentary-card">
-            <div class="stats-card-header">&#129302; Performance Analysis</div>
+            <div class="stats-card-header">{{ icon('gauge') }} Training notes</div>
             <div class="stats-card-body">
               <div class="commentary-text" id="commentary-text" style="color:var(--text-muted);font-style:italic">Analysis will appear every 5 epochs…</div>
               <div class="commentary-epoch hidden" id="commentary-epoch"></div>
@@ -523,7 +500,7 @@
            ══════════════════════════════════════════════════════════════ -->
       <div class="results-container hidden" id="results-container">
         <div class="results-header">
-          <h2>&#127881; Training Complete</h2>
+          <h2>Training complete</h2>
           <div style="font-size:13px;color:var(--text-secondary);margin-left:auto" id="results-session-tag"></div>
         </div>
         <div class="results-body">
@@ -542,42 +519,34 @@
               <div style="font-size:13px;font-weight:600;color:var(--text-primary)">best.pt &#8594; models/</div>
               <div class="result-file-path" id="res-model-path">—</div>
               <div style="display:flex;gap:8px;flex-wrap:wrap">
-                <a id="res-download-btn" class="btn btn-success" href="#" download>&#8615; Download .pt</a>
-                <button class="btn btn-secondary" onclick="trainAnother()">&#128260; Train Another</button>
+                <a id="res-download-btn" class="btn btn-success" href="#" download>{{ icon('download') }}Download .pt</a>
+                <button class="btn btn-secondary" onclick="trainAnother()">{{ icon('refresh-cw') }}Train another</button>
               </div>
             </div>
           </div>
         </div>
       </div>
 
-      <!-- Saved Models Library -->
-      <div class="setup-step models-library" id="models-library" style="margin-top:4px">
+      <!-- Run history (local runs + imported cloud runs) -->
+      <div class="setup-step models-library" id="runs" style="margin-top:4px">
         <div class="step-header">
-          <div class="step-title">&#128450; Saved Models Library</div>
-          <button class="btn btn-ghost btn-sm" onclick="loadModelsLibrary()">&#8635; Refresh</button>
+          <div class="step-title">{{ icon('history') }} Training runs</div>
+          <div style="margin-left:auto;display:flex;gap:6px">
+            <label class="btn btn-secondary btn-sm" for="import-result-input" data-tip="The invictus_result_….zip from a Kaggle / Colab run (or any .pt)">{{ icon('upload') }}Import cloud result</label>
+            <input type="file" id="import-result-input" accept=".zip,.pt" hidden/>
+            <button class="btn btn-ghost btn-sm" onclick="loadRuns()">{{ icon('refresh-cw') }}Refresh</button>
+          </div>
         </div>
         <div class="step-body" style="padding:14px 20px">
-          <div class="models-library-list" id="models-library-list">
-            <div class="text-muted text-sm" style="padding:12px;text-align:center">No models saved yet.</div>
+          <div class="runs-list" id="runs-list">
+            <div class="text-muted text-sm" style="padding:12px;text-align:center">No runs yet.</div>
           </div>
+          <p class="text-muted text-sm" style="margin-top:10px">No GPU here? Build a free cloud-training bundle in a project's <b>Export &amp; cloud training</b> section, train on Kaggle or Colab, then import the result above.</p>
         </div>
       </div>
 
     </div><!-- /training-content -->
   </div><!-- /training-root -->
 
-  <div id="toast-container"></div>
-
-  <div class="modal-overlay hidden" id="modal-overlay" onclick="closeModal(event)">
-    <div class="modal" id="modal-box">
-      <div class="modal-title" id="modal-title"></div>
-      <div id="modal-body"></div>
-      <div class="modal-actions" id="modal-actions"></div>
-    </div>
-  </div>
-
-  <script src="/static/js/vendor/socket.io.min.js"></script>
-  <script src="/static/js/socket.js?v=2.0.0"></script>
-  <script src="/static/js/training.js?v=3.0.0"></script>
-</body>
-</html>
+{% endblock %}
+{% block scripts %}<script src="{{ asset('js/training.js') }}"></script>{% endblock %}

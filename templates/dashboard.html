@@ -1,514 +1,341 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Dashboard — Invictus Annotate</title>
-  <link rel="stylesheet" href="/static/css/main.css"/>
-  <link rel="stylesheet" href="/static/css/dashboard.css"/>
-</head>
-<body>
+{% extends "base.html" %}
+{% from "_brand.html" import icon %}
+{% block title %}Project{% endblock %}
+{% block head %}<link rel="stylesheet" href="{{ asset('css/pages.css') }}"/>{% endblock %}
+{% block topbar_actions %}
+<a class="btn btn-sm" id="top-annotate" href="/projects/{{ project_id }}/view">{{ icon('pencil') }}My images</a>
+{% endblock %}
+{% block content %}
+<main class="page">
 
-  <!-- Topbar -->
-  <header class="topbar">
-    <div class="topbar-brand">
-      <div class="logo-dot"></div>
-      Invictus Annotate
-      <span style="font-size:10px;background:var(--accent-dim);color:var(--accent-light);padding:2px 7px;border-radius:100px;font-weight:600">ADMIN</span>
-    </div>
-    <div class="topbar-spacer"></div>
-    <div class="conn-indicator">
-      <div class="conn-dot" id="conn-dot"></div>
-      <span id="conn-label">Connecting</span>
-    </div>
-    <button class="btn btn-ghost btn-sm" onclick="IA.logout()">Sign out</button>
-  </header>
-
-  <div class="dash-layout">
-
-    <!-- Sidebar -->
-    <nav class="sidebar">
-      <!-- Home link — always first -->
-      <a class="nav-item nav-home-item" href="/home" id="nav-home">
-        <span class="nav-icon">🏠</span> Home
-      </a>
-
-      <div class="sidebar-section-label">Project</div>
-      <a class="nav-item active" id="nav-overview" onclick="showSection('overview')">
-        <span class="nav-icon">📊</span> Overview
-      </a>
-      <a class="nav-item" id="nav-import" onclick="showSection('import')">
-        <span class="nav-icon">📁</span> Import Images
-      </a>
-      <a class="nav-item" id="nav-assign" onclick="showSection('assign')">
-        <span class="nav-icon">👤</span> Assign
-        <span class="nav-badge" id="nav-unassigned-cnt">0</span>
-      </a>
-      <a class="nav-item" id="nav-review" onclick="showSection('review')">
-        <span class="nav-icon">✅</span> Review Queue
-        <span class="nav-badge" id="nav-ready-cnt">0</span>
-      </a>
-      <a class="nav-item" id="nav-all-images" onclick="showSection('all-images')">
-        <span class="nav-icon">🖼️</span> All Images
-      </a>
-      <a class="nav-item" id="nav-my-annotations" style="background: rgba(124,109,255,0.06); border: 1px dashed rgba(124,109,255,0.3); font-weight:600;" href="/projects/{{ project_id }}/view">
-        <span class="nav-icon">✏️</span> My Annotations
-      </a>
-
-      <div class="sidebar-section-label">Admin</div>
-      <a class="nav-item" id="nav-users" onclick="showSection('users')">
-        <span class="nav-icon">👥</span> Users
-      </a>
-      <a class="nav-item" id="nav-classes" onclick="showSection('classes')">
-        <span class="nav-icon">🏷</span> Classes
-      </a>
-      <a class="nav-item" id="nav-dataset" onclick="showSection('dataset')">
-        <span class="nav-icon">📦</span> Dataset
-      </a>
-      <a class="nav-item" id="nav-train" href="/train" target="_blank" style="background:rgba(34,211,160,0.06);border:1px dashed rgba(34,211,160,0.3);">
-        <span class="nav-icon">🧠</span> Train Model
-      </a>
-
-      <div style="flex:1"></div>
-      <div style="padding:10px;font-size:11px;color:var(--text-muted)">
-        <div id="project-name-side" style="font-weight:600;color:var(--text-secondary)">Loading…</div>
-        <div id="source-folder-side" style="margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
+  <div class="page-head">
+    <div class="hero">
+      <div class="hero-thumb" id="hero-thumb"></div>
+      <div>
+        <div class="eyebrow" id="section-eyebrow">Overview</div>
+        <h1 id="project-name">&nbsp;</h1>
+        <p id="project-meta" class="small"></p>
       </div>
-    </nav>
-
-    <!-- Main content -->
-    <main class="dash-main">
-
-      <!-- ── OVERVIEW ──────────────────────────────────────────────────── -->
-      <section class="dash-section active" id="section-overview">
-        <div class="breadcrumb">
-          <a href="/home">🏠 Home</a>
-          <span class="bc-sep">/</span>
-          <span class="bc-current" id="bc-project-name">Project</span>
-        </div>
-        <div class="page-header">
-          <h2>Overview</h2>
-          <div style="font-size:12px;color:var(--text-muted)" id="project-label">Loading…</div>
-        </div>
-
-        <div class="stats-grid" id="overview-stats">
-          <div class="stat-card" style="--stat-color:var(--text-muted)"><div class="stat-value" id="s-total">0</div><div class="stat-label">Total Images</div></div>
-          <div class="stat-card" style="--stat-color:#5a5a78"><div class="stat-value" id="s-unassigned">0</div><div class="stat-label">Unassigned</div></div>
-          <div class="stat-card" style="--stat-color:var(--blue)"><div class="stat-value" id="s-assigned">0</div><div class="stat-label">Assigned</div></div>
-          <div class="stat-card" style="--stat-color:var(--yellow)"><div class="stat-value" id="s-unannotated">0</div><div class="stat-label">Unannotated</div></div>
-          <div class="stat-card" style="--stat-color:var(--orange)"><div class="stat-value" id="s-annotated">0</div><div class="stat-label">Annotated</div></div>
-          <div class="stat-card" style="--stat-color:var(--green)"><div class="stat-value" id="s-ready">0</div><div class="stat-label">Ready</div></div>
-          <div class="stat-card" style="--stat-color:var(--accent-light)"><div class="stat-value" id="s-exported">0</div><div class="stat-label">Exported</div></div>
-        </div>
-
-        <div class="panel">
-          <div class="panel-header"><h3>Live Feed</h3><span style="font-size:11px;color:var(--green)">● Real-time</span></div>
-          <div class="panel-body">
-            <div class="feed-list" id="feed-list">
-              <div class="text-muted text-sm" style="padding:16px 0;text-align:center">Waiting for activity…</div>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- ── IMPORT ─────────────────────────────────────────────────────── -->
-      <section class="dash-section" id="section-import">
-        <div class="breadcrumb">
-          <a href="/home">🏠 Home</a>
-          <span class="bc-sep">/</span>
-          <span class="bc-current" id="bc-project-name-import">Project</span>
-        </div>
-        <div class="page-header">
-          <h2>Import Images</h2>
-        </div>
-        <div class="panel">
-          <div class="panel-header"><h3>Folder Import</h3></div>
-          <div class="panel-body">
-            <p style="color:var(--text-secondary);font-size:13px;margin-bottom:16px">
-              Enter the folder path containing the images on <strong>this server machine</strong>, or leave it blank to open a native folder picker.
-              All JPG/JPEG images in the selected folder will be imported.
-            </p>
-            <div style="display:flex;gap:10px;align-items:center;max-width:650px">
-              <input class="form-input" id="import-folder-path" placeholder="e.g. C:\datasets\images" style="flex:1"/>
-              <button class="btn btn-primary" id="import-btn" onclick="importImages()" style="flex-shrink:0">
-                📁 Import Images
-              </button>
-            </div>
-            <div id="import-result" class="mt-16 hidden"></div>
-          </div>
-        </div>
-
-        <div class="panel mt-16">
-          <div class="panel-header"><h3>Video Tools</h3></div>
-          <div class="panel-body">
-            <p style="color:var(--text-secondary);font-size:13px;margin-bottom:16px">
-              Need to extract frames from a video or cut a specific clip losslessly?
-            </p>
-            <div style="display: flex; gap: 10px;">
-              <a href="/video_processor" target="_blank" class="btn btn-secondary" style="text-decoration:none;">
-                ✂️ Process Video
-              </a>
-            </div>
-
-            <hr style="margin:20px 0; border:none; border-top:1px solid var(--border);" />
-
-            <div class="panel-header" style="padding:0; margin-bottom:8px;"><h3>Import Video</h3></div>
-            <p style="color:var(--text-secondary);font-size:13px;margin-bottom:16px">
-              Extract frames from a video at a specific FPS and import them directly into the dataset.
-            </p>
-            <button onclick="openVideoImportModal()" class="btn btn-primary" style="display:inline-block; text-decoration:none;">
-              🎞️ Import Video
-            </button>
-          </div>
-        </div>
-
-        <div class="panel mt-16">
-          <div class="panel-header">
-            <h3>Imported Images</h3>
-            <span id="imported-count" style="font-size:12px;color:var(--text-muted)"></span>
-          </div>
-          <div class="image-grid" id="import-image-grid">
-            <div class="text-muted text-sm" style="padding:20px;grid-column:1/-1">No images imported yet.</div>
-          </div>
-        </div>
-      </section>
-
-      <!-- ── ASSIGN ─────────────────────────────────────────────────────── -->
-      <section class="dash-section" id="section-assign">
-        <div class="breadcrumb">
-          <a href="/home">🏠 Home</a>
-          <span class="bc-sep">/</span>
-          <span class="bc-current" id="bc-project-name-assign">Project</span>
-        </div>
-        
-        <div class="page-header">
-          <h2>Assign Images</h2>
-        </div>
-
-        <div class="assign-grid-layout">
-          <!-- Left: Users panel -->
-          <div class="panel" style="margin-bottom: 0;">
-            <div class="panel-header">
-              <h3>Users & Distribution</h3>
-            </div>
-            <div class="panel-body" style="display: flex; flex-direction: column; gap: 14px;">
-              <p style="color: var(--text-secondary); font-size: 13px;">
-                Select users below to auto-distribute images equally.
-              </p>
-              
-              <!-- Users Checklist -->
-              <div id="assign-users-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 280px; overflow-y: auto; padding-right: 4px;">
-                <div class="text-muted text-sm" style="padding:10px; text-align:center;">Loading users…</div>
-              </div>
-              
-              <!-- Checklist controls -->
-              <div style="display: flex; gap: 8px;">
-                <button class="btn btn-ghost btn-sm" onclick="selectAllUsers()" style="padding: 2px 6px;">Select All</button>
-                <button class="btn btn-ghost btn-sm" onclick="selectNoUsers()" style="padding: 2px 6px;">Deselect All</button>
-              </div>
-              
-              <div style="border-top: 1px solid var(--border); margin: 6px 0;"></div>
-              
-              <!-- Distribution stats & live preview -->
-              <div id="distribution-stats" style="background: var(--bg-elevated); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; font-size: 13px; display: flex; flex-direction: column; gap: 6px;">
-                <div style="display: flex; justify-content: space-between;">
-                  <span style="color: var(--text-secondary)">Total Unassigned:</span>
-                  <strong id="dist-unassigned-cnt">0</strong>
-                </div>
-                <div style="display: flex; justify-content: space-between;">
-                  <span style="color: var(--text-secondary)">Selected Images:</span>
-                  <strong id="dist-selected-cnt">0</strong>
-                </div>
-                <div style="display: flex; justify-content: space-between;">
-                  <span style="color: var(--text-secondary)">Selected Users:</span>
-                  <strong id="dist-users-cnt">0</strong>
-                </div>
-                <div style="border-top: 1px dashed var(--border); margin: 4px 0;"></div>
-                <div id="dist-preview-msg" style="color: var(--accent-light); font-weight: 500; font-size: 12px; line-height: 1.4;">
-                  Select users to distribute.
-                </div>
-              </div>
-              
-              <button class="btn btn-primary" id="btn-auto-distribute" onclick="autoDistribute()" style="justify-content: center; width: 100%;">
-                ⚡ Auto-Distribute
-              </button>
-            </div>
-          </div>
-
-          <!-- Right: Image selection and manual assignment -->
-          <div class="panel" style="margin-bottom: 0;">
-            <div class="panel-header">
-              <h3>Unassigned Images</h3>
-              <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
-                <select class="form-select" id="assign-user-select" style="width: 140px; height: 32px; font-size: 12px; padding: 2px 8px; background: var(--bg-elevated); border: 1px solid var(--border-strong); border-radius: var(--radius-sm);">
-                  <option value="">Select user…</option>
-                </select>
-                <button class="btn btn-primary btn-sm" onclick="assignSelected()">Assign Selected</button>
-                <button class="btn btn-secondary btn-sm" onclick="assignToMe()" title="Assign selected or all unassigned images to Admin">👤 Assign to Me</button>
-              </div>
-            </div>
-            <div class="panel-body">
-              <div style="display: flex; gap: 8px; margin-bottom: 12px; align-items: center;">
-                <button class="btn btn-ghost btn-sm" onclick="selectAll()">Select All</button>
-                <button class="btn btn-ghost btn-sm" onclick="selectNone()">Deselect All</button>
-                <span id="selected-count" style="font-size: 12px; color: var(--text-muted); margin-left: 4px;">0 selected</span>
-              </div>
-              
-              <div class="image-grid" id="assign-image-grid" style="max-height: 480px;">
-                <div class="text-muted text-sm" style="padding: 20px; grid-column: 1/-1;">Loading…</div>
-              </div>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- ── REVIEW QUEUE ───────────────────────────────────────────────── -->
-      <section class="dash-section" id="section-review">
-        <div class="breadcrumb">
-          <a href="/home">🏠 Home</a>
-          <span class="bc-sep">/</span>
-          <span class="bc-current" id="bc-project-name-review">Project</span>
-        </div>
-        <div class="page-header">
-          <h2>Review Queue</h2>
-          <div style="display:flex;gap:12px;align-items:center">
-            <span class="badge badge-ready" id="ready-badge">0 ready</span>
-            <button class="btn btn-success btn-sm hidden" id="review-export-btn" onclick="runExportFromReview()">📦 Export all to Dataset</button>
-          </div>
-        </div>
-        <p style="color:var(--text-secondary);font-size:13px;margin-bottom:20px">
-          Images submitted by annotators. Delete to remove entirely, or open to view/edit annotations.
-        </p>
-        <div class="review-grid" id="review-grid">
-          <div class="text-muted text-sm" style="padding:20px;grid-column:1/-1">No images in review queue.</div>
-        </div>
-      </section>
-
-      <!-- ── ALL IMAGES ─────────────────────────────────────────────────── -->
-      <section class="dash-section" id="section-all-images">
-        <div class="breadcrumb">
-          <a href="/home">🏠 Home</a>
-          <span class="bc-sep">/</span>
-          <span class="bc-current" id="bc-project-name-all-images">Project</span>
-        </div>
-        <div class="page-header">
-          <h2>All Images</h2>
-          <div style="display:flex;gap:12px;align-items:center">
-            <span class="badge" id="all-images-count-badge" style="background:var(--bg-elevated);color:var(--text-secondary);border:1px solid var(--border-strong);">0 images</span>
-          </div>
-        </div>
-        <p style="color:var(--text-secondary);font-size:13px;margin-bottom:20px">
-          View all annotated, unannotated, unassigned, and ready/exported images in the project across all users. Click on any card to view or edit annotations.
-        </p>
-
-        <!-- Filter bar -->
-        <div class="filter-bar" style="margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;">
-          <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-            <button class="filter-btn active" id="all-img-filter-all" onclick="setAllImagesFilter('all')">
-              All
-            </button>
-            <button class="filter-btn" id="all-img-filter-unassigned" onclick="setAllImagesFilter('unassigned')">
-              ⚪ Unassigned
-            </button>
-            <button class="filter-btn" id="all-img-filter-unannotated" onclick="setAllImagesFilter('unannotated')">
-              🟡 Unannotated
-            </button>
-            <button class="filter-btn" id="all-img-filter-annotated" onclick="setAllImagesFilter('annotated')">
-              🟠 Annotated
-            </button>
-            <button class="filter-btn" id="all-img-filter-ready" onclick="setAllImagesFilter('ready_for_export')">
-              🟢 Ready
-            </button>
-            <button class="filter-btn" id="all-img-filter-exported" onclick="setAllImagesFilter('exported')">
-              📦 Exported
-            </button>
-          </div>
-          <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-secondary); cursor: pointer; user-select: none;">
-            <input type="checkbox" id="all-images-show-previews" checked onchange="toggleAllImagesPreviews(this.checked)" style="accent-color: var(--accent);"/>
-            Show Image Previews
-          </label>
-        </div>
-
-        <div class="image-grid" id="all-images-grid" style="max-height: 520px;">
-          <div class="text-muted text-sm" style="padding:20px;grid-column:1/-1;text-align:center">Loading images…</div>
-        </div>
-
-        <!-- Pagination bar -->
-        <div class="pagination-bar" id="all-images-pagination" style="display:none; margin-top:20px; border-top:1px solid var(--border); padding-top:20px;">
-          <div class="per-page-row">
-            <span>Load per page:</span>
-            <button class="per-page-btn active" id="all-pp-50" onclick="setAllImagesPerPage(50)">50</button>
-            <button class="per-page-btn" id="all-pp-100" onclick="setAllImagesPerPage(100)">100</button>
-            <button class="per-page-btn" id="all-pp-200" onclick="setAllImagesPerPage(200)">200</button>
-          </div>
-          <div class="page-nav">
-            <button class="page-nav-btn" id="all-btn-prev" onclick="goAllImagesPage(-1)" disabled>◀</button>
-            <span class="page-info">
-              Page <strong id="all-page-current">1</strong> of <strong id="all-page-total">1</strong>
-              &nbsp;·&nbsp; <strong id="all-total-count">0</strong> images
-            </span>
-            <button class="page-nav-btn" id="all-btn-next" onclick="goAllImagesPage(1)">▶</button>
-          </div>
-        </div>
-      </section>
-
-      <!-- ── USERS ──────────────────────────────────────────────────────── -->
-      <section class="dash-section" id="section-users">
-        <div class="page-header">
-          <h2>Users</h2>
-          <button class="btn btn-primary btn-sm" onclick="showCreateUser()">+ Add User</button>
-        </div>
-
-        <div id="create-user-form" class="panel hidden" style="margin-bottom:16px">
-          <div class="panel-header"><h3>New User</h3></div>
-          <div class="panel-body">
-            <div style="display:grid;grid-template-columns:1fr 1fr auto auto;gap:10px;align-items:flex-end">
-              <div class="form-group">
-                <label class="form-label">Username</label>
-                <input class="form-input" id="new-username" placeholder="username"/>
-              </div>
-              <div class="form-group">
-                <label class="form-label">Password</label>
-                <input class="form-input" id="new-password" type="password" placeholder="password"/>
-              </div>
-              <div class="form-group">
-                <label class="form-label">Role</label>
-                <select class="form-select" id="new-is-admin">
-                  <option value="false">Annotator</option>
-                  <option value="true">Admin</option>
-                </select>
-              </div>
-              <button class="btn btn-primary" onclick="createUser()" style="height:38px">Create</button>
-            </div>
-          </div>
-        </div>
-
-        <div class="table-wrap">
-          <table>
-            <thead><tr>
-              <th>User</th><th>Role</th><th>Assigned</th><th>Annotated</th><th>Ready</th><th>Actions</th>
-            </tr></thead>
-            <tbody id="users-table-body">
-              <tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:24px">Loading…</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <!-- ── CLASSES ────────────────────────────────────────────────────── -->
-      <section class="dash-section" id="section-classes">
-        <div class="page-header">
-          <h2>Class Labels</h2>
-          <button class="btn btn-primary btn-sm" onclick="saveClasses()">Save Classes</button>
-        </div>
-        <div class="panel">
-          <div class="panel-body">
-            <p style="color:var(--text-secondary);font-size:13px;margin-bottom:16px">
-              Add or remove classes. <strong>Warning:</strong> removing a class will not delete existing annotations, but those boxes will be flagged as orphans at export time.
-            </p>
-            <div class="classes-wrap" id="classes-wrap"></div>
-            <div style="display:flex;gap:8px;margin-top:14px">
-              <input class="form-input" id="new-class-input" placeholder="New class name…" style="max-width:240px"/>
-              <button class="btn btn-secondary" onclick="addClassTag()">+ Add</button>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- ── DATASET (EXPORT) ───────────────────────────────────────────── -->
-      <section class="dash-section" id="section-dataset">
-        <div class="page-header">
-          <h2>Dataset Export</h2>
-        </div>
-
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
-          <div class="panel">
-            <div class="panel-header"><h3>Split Configuration</h3></div>
-            <div class="panel-body">
-              <div class="split-sliders">
-                <div class="slider-row">
-                  <span class="slider-label" style="color:var(--green)">Train</span>
-                  <input type="range" id="sl-train" min="0" max="100" value="80" oninput="syncSliders('train')"/>
-                  <span class="slider-val" id="sv-train">80%</span>
-                </div>
-                <div class="slider-row">
-                  <span class="slider-label" style="color:var(--blue)">Valid</span>
-                  <input type="range" id="sl-valid" min="0" max="100" value="10" oninput="syncSliders('valid')"/>
-                  <span class="slider-val" id="sv-valid">10%</span>
-                </div>
-                <div class="slider-row">
-                  <span class="slider-label" style="color:var(--orange)">Test</span>
-                  <input type="range" id="sl-test" min="0" max="100" value="10" oninput="syncSliders('test')"/>
-                  <span class="slider-val" id="sv-test">10%</span>
-                </div>
-              </div>
-              <label style="display:flex;align-items:center;gap:8px;margin-top:16px;font-size:13px;cursor:pointer">
-                <input type="checkbox" id="include-test" checked/>
-                Include test/ folder
-              </label>
-              <div class="divider"></div>
-              <div id="export-preview" style="font-size:13px;color:var(--text-secondary)">
-                Loading preview…
-              </div>
-            </div>
-          </div>
-
-          <div class="panel">
-            <div class="panel-header"><h3>data.yaml Preview</h3></div>
-            <div class="panel-body">
-              <div class="yaml-block" id="yaml-preview">Generating…</div>
-            </div>
-          </div>
-        </div>
-
-        <div class="panel mt-16" style="margin-top:16px">
-          <div class="panel-header"><h3>Export</h3></div>
-          <div class="panel-body">
-            <p style="color:var(--text-secondary);font-size:13px;margin-bottom:16px">
-              Exports all <strong>Ready for Export</strong> and <strong>previously exported</strong> images to the <code>dataset/{project-id}/</code> folder.
-              Images are marked as <em>Exported</em> after this runs.
-            </p>
-            <button class="btn btn-success" id="export-btn" onclick="runExport()" style="font-size:14px;padding:10px 24px">
-              📦 Export Dataset
-            </button>
-            <div id="export-progress" class="hidden mt-16">
-              <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px">Exporting… <span id="export-pct">0%</span></div>
-              <div class="progress-bar"><div class="progress-fill" id="export-prog-fill" style="width:0%"></div></div>
-            </div>
-            <div id="export-result" class="hidden"></div>
-          </div>
-        </div>
-
-        <div class="panel mt-16" style="margin-top:16px">
-          <div class="panel-header">
-            <h3>Exported Images</h3>
-            <span id="exported-count" style="font-size:12px;color:var(--text-muted)">0 images</span>
-          </div>
-          <div class="panel-body">
-            <div class="image-grid" id="exported-image-grid">
-              <div class="text-muted text-sm" style="padding:20px;grid-column:1/-1;text-align:center">No images exported yet.</div>
-            </div>
-          </div>
-        </div>
-      </section>
-
-    </main>
-  </div>
-
-  <!-- Toast -->
-  <div id="toast-container"></div>
-
-  <!-- Modal -->
-  <div class="modal-overlay hidden" id="modal-overlay" onclick="closeModal(event)">
-    <div class="modal" id="modal-box">
-      <div class="modal-title" id="modal-title"></div>
-      <div id="modal-body"></div>
-      <div class="modal-actions" id="modal-actions"></div>
     </div>
+    <div class="page-actions" id="section-actions"></div>
   </div>
 
-  <script src="/static/js/vendor/socket.io.min.js"></script>
-  <script src="/static/js/socket.js?v=2.0.0"></script>
-  <script src="/static/js/dashboard.js?v=2.0.0"></script>
-</body>
-</html>
+  <!-- ── OVERVIEW ─────────────────────────────────────────────── -->
+  <section class="dash-section" data-section="overview">
+    <div id="ov-files" class="hidden" style="margin-bottom:16px"></div>
+    <div class="stats" id="ov-stats">
+      <div class="stat"><div class="stat-label">Images</div><div class="stat-value" data-s="total">—</div></div>
+      <div class="stat"><div class="stat-label"><span class="dot" style="--dot:var(--st-unassigned)"></span>Unassigned</div><div class="stat-value" data-s="unassigned">—</div></div>
+      <div class="stat"><div class="stat-label"><span class="dot" style="--dot:var(--st-assigned)"></span>To annotate</div><div class="stat-value" data-s="pending">—</div><div class="stat-sub" data-s="pending-sub"></div></div>
+      <div class="stat"><div class="stat-label"><span class="dot" style="--dot:var(--st-annotated)"></span>Annotated</div><div class="stat-value" data-s="done">—</div><div class="stat-sub" data-s="done-sub"></div></div>
+      <div class="stat"><div class="stat-label"><span class="dot" style="--dot:var(--st-ready)"></span>In dataset</div><div class="stat-value" data-s="ready_for_export">—</div></div>
+      <div class="stat"><div class="stat-label"><span class="dot" style="--dot:var(--st-exported)"></span>Exported</div><div class="stat-value" data-s="exported">—</div></div>
+    </div>
+
+    <div class="overview-grid">
+      <div class="stack">
+        <div class="panel progress-card">
+          <div class="panel-body">
+            <div class="row between"><span class="muted small">Progress</span><span class="muted small" id="ov-progress-meta"></span></div>
+            <div class="big-pct" id="ov-pct">0%</div>
+            <div id="ov-bar"></div>
+            <div class="legend" id="ov-legend"></div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-head"><h3>People</h3><a class="link small" href="#assign">Assign images</a></div>
+          <div class="panel-body"><div class="people" id="ov-people"></div></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h3>Activity</h3><span class="meta">Live</span></div>
+        <div class="panel-body"><div class="feed" id="feed"><div class="empty" style="padding:24px 0"><p>Saves, submissions and assignments appear here as they happen.</p></div></div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── ALL IMAGES ───────────────────────────────────────────── -->
+  <section class="dash-section" data-section="images">
+    <div class="toolbar">
+      <div class="seg" id="img-filter"></div>
+      <div class="row">
+        <select class="select select-sm" id="img-assignee" style="width:auto"><option value="">Anyone</option></select>
+        <select class="select select-sm" id="img-per-page" style="width:auto"><option>50</option><option>100</option><option>200</option></select>
+      </div>
+    </div>
+    <div class="thumbs selectable" id="img-grid"></div>
+    <div class="pager" id="img-pager"></div>
+  </section>
+
+  <!-- ── VIDEO → FRAMES ───────────────────────────────────────── -->
+  <section class="dash-section" data-section="video">
+    <div class="grid-2">
+      <div class="panel">
+        <div class="panel-head"><h3>{{ icon('film') }}Extract frames from a video</h3></div>
+        <div class="panel-body drop-steps">
+          <div>
+            <div class="field">
+              <label for="vid-path">Video file on this server</label>
+              <div class="input-group">
+                <input class="input" id="vid-path" placeholder="D:\videos\site-cam-01.mp4" spellcheck="false"/>
+                <button class="btn" id="vid-browse">{{ icon('folder-open') }}Browse…</button>
+              </div>
+              <span class="hint" id="vid-info">MP4, MKV, AVI, MOV or WEBM.</span>
+            </div>
+          </div>
+          <div>
+            <div class="stack">
+            <div class="grid-2">
+              <div class="field">
+                <label for="vid-fps">Frames per second to keep</label>
+                <input class="input" id="vid-fps" type="number" min="0.05" step="0.05" value="2"/>
+                <span class="hint" id="vid-estimate">Lower = fewer, more varied frames.</span>
+              </div>
+              <div class="field">
+                <label>Image format</label>
+                <div class="seg" id="vid-format"><button class="active" data-v="jpg">JPG</button><button data-v="png">PNG</button></div>
+                <span class="hint">JPG is ~10× smaller with no visible loss for training.</span>
+              </div>
+            </div>
+            <div class="field">
+              <label for="vid-dedupe">Skip near-identical frames</label>
+              <select class="select" id="vid-dedupe" style="max-width:320px">
+                <option value="0">Keep every frame</option>
+                <option value="1" selected>Light — drop frames where nothing moved</option>
+                <option value="2">Strong — keep only clearly different frames</option>
+              </select>
+              <span class="hint">A camera that stands still produces many identical frames; labelling them adds nothing.</span>
+            </div>
+            <div class="small muted" id="vid-disk"></div>
+            </div>
+          </div>
+          <div>
+            <div class="stack">
+              <button class="btn btn-primary" id="vid-go" style="align-self:flex-start">{{ icon('film') }}Extract &amp; import frames</button>
+              <div class="hidden" id="vid-progress-wrap">
+                <div class="row between small"><span id="vid-stage" class="muted">Extracting…</span><span id="vid-pct" class="num muted"></span></div>
+                <div class="progress" style="margin-top:6px"><span id="vid-bar"></span></div>
+              </div>
+              <div id="vid-result"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h3>Tips for video datasets</h3></div>
+        <div class="panel-body stack small">
+          <p>Consecutive frames are nearly identical. Labelling 30 of them per second mostly repeats work and teaches the model nothing new — 1–3 fps is usually plenty.</p>
+          <p>Frames keep their order, so in the annotator you can turn on <b>Carry boxes forward</b>, or <b>Propagate</b> a box across many frames when the object doesn't move.</p>
+          <p>Need only part of a long recording? Trim it first in <a class="link" href="/video_processor">Video tools</a>.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── IMPORT ───────────────────────────────────────────────── -->
+  <section class="dash-section" data-section="import">
+    <div class="grid-2">
+      <div class="panel">
+        <div class="panel-head"><h3>{{ icon('folder-open') }}Import a folder of images</h3></div>
+        <div class="panel-body stack">
+          <div class="field">
+            <label for="imp-path">Folder on this server</label>
+            <div class="input-group">
+              <input class="input" id="imp-path" placeholder="D:\datasets\site-a" spellcheck="false"/>
+              <button class="btn" id="imp-browse">{{ icon('folder-open') }}Browse…</button>
+            </div>
+            <span class="hint">JPG, PNG, WEBP, BMP and TIFF. Files already in the project are skipped.</span>
+          </div>
+          <label class="switch"><input type="checkbox" id="imp-recursive"/>Include subfolders</label>
+          <button class="btn btn-primary" id="imp-go" style="align-self:flex-start">{{ icon('upload') }}Import images</button>
+          <div id="imp-result"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h3>{{ icon('refresh-cw') }}Moved your images?</h3></div>
+        <div class="panel-body stack">
+          <p class="small">If image folders were moved or renamed, point the project at their new location. Files are matched by name; annotations are kept.</p>
+          <div class="row"><button class="btn btn-sm" id="chk-go">Check for missing files</button><span class="small muted" id="chk-result"></span></div>
+          <div class="field">
+            <label for="rel-path">New location</label>
+            <div class="input-group">
+              <input class="input" id="rel-path" placeholder="D:\new\place" spellcheck="false"/>
+              <button class="btn" id="rel-browse">{{ icon('folder-open') }}Browse…</button>
+              <button class="btn btn-primary" id="rel-go">Relink</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── ASSIGN ───────────────────────────────────────────────── -->
+  <section class="dash-section" data-section="assign">
+    <div class="assign-layout">
+      <div class="panel">
+        <div class="panel-head"><h3>Distribute</h3><span class="meta" id="as-unassigned"></span></div>
+        <div class="panel-body stack">
+          <div class="user-pick" id="as-users"></div>
+          <div class="row"><button class="btn btn-ghost btn-sm" id="as-all">Select all</button><button class="btn btn-ghost btn-sm" id="as-none">None</button></div>
+          <div class="field">
+            <label>How to split</label>
+            <div class="seg" id="as-strategy"><button class="active" data-v="contiguous">Consecutive ranges</button><button data-v="round_robin">Round-robin</button></div>
+            <span class="hint" id="as-strategy-hint">Each person gets one continuous run of frames — best for video, and needed for carry / propagate.</span>
+          </div>
+          <div class="plan-preview" id="as-plan"></div>
+          <button class="btn btn-primary btn-block" id="as-go">Distribute images</button>
+        </div>
+      </div>
+      <div>
+        <div class="toolbar">
+          <div class="row"><h3 style="font-size:var(--fs-md)">Unassigned images</h3><span class="muted small" id="as-count"></span></div>
+          <div class="row"><button class="btn btn-sm" id="as-page-all">Select page</button></div>
+        </div>
+        <div class="thumbs selectable" id="as-grid" style="--thumb-min:140px"></div>
+        <div class="pager" id="as-pager"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── REVIEW ───────────────────────────────────────────────── -->
+  <section class="dash-section" data-section="review">
+    <div class="toolbar">
+      <div class="seg" id="rv-filter">
+        <button class="active" data-v="awaiting_review" data-k="awaiting_review">Waiting <span class="count"></span></button><button data-v="approved" data-k="approved">Approved <span class="count"></span></button><button data-v="rejected" data-k="rejected">Sent back <span class="count"></span></button><button data-v="ready_for_export,exported" data-k="inds">All in dataset <span class="count"></span></button>
+      </div>
+      <div class="row">
+        <button class="btn btn-sm btn-success" id="rv-submit-all" disabled>{{ icon('check-check') }}<span>Add All Annotated Images to Dataset</span></button>
+        <a class="btn btn-sm" href="#export">{{ icon('package') }}Go to export</a>
+      </div>
+    </div>
+    <p class="small muted" style="margin:-4px 0 12px">Select frames to approve them or send them back with a note. Opening a frame lets you fix it yourself (saving sends it back to “annotated”). Export can be limited to approved frames.</p>
+    <div class="thumbs selectable" id="rv-grid"></div>
+    <div class="pager" id="rv-pager"></div>
+  </section>
+
+  <!-- ── MODEL ASSIST ─────────────────────────────────────────── -->
+  <section class="dash-section" data-section="assist">
+    <div class="panel" style="margin-bottom:16px">
+      <div class="panel-body assist-head">
+        <div class="field" style="flex:1;min-width:260px;margin:0">
+          <label for="as-model">Model</label>
+          <select class="select" id="as-model"><option value="">Loading models…</option></select>
+          <span class="hint" id="as-model-hint">Any model trained here or imported from cloud training.</span>
+        </div>
+        <div class="small muted" id="as-device" style="max-width:340px"></div>
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="panel">
+        <div class="panel-head"><h3>{{ icon('sparkle') }}Pre-label empty frames</h3></div>
+        <div class="panel-body stack">
+          <p class="small">The model draws its boxes on frames nobody has labelled yet. Annotators see them dashed, fix what's wrong and press <kbd>Enter</kbd> — usually several times faster than drawing from scratch. Frames stay “to do” until a person accepts them.</p>
+          <div class="field"><label for="pl-conf">Minimum confidence <b id="pl-conf-v" class="num">0.30</b></label>
+            <input type="range" id="pl-conf" min="0.05" max="0.9" step="0.05" value="0.3"/>
+            <span class="hint">Higher = fewer, surer boxes. Lower = more boxes to delete.</span></div>
+          <div class="row"><button class="btn btn-primary" id="pl-go">{{ icon('sparkle') }}Pre-label <span id="pl-count"></span></button>
+            <button class="btn btn-ghost hidden" id="pl-undo">{{ icon('undo-2') }}Undo last pre-label</button></div>
+          <div id="pl-job"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h3>{{ icon('flag') }}Find label mistakes</h3></div>
+        <div class="panel-body stack">
+          <p class="small">The model looks at frames that are already labelled and lists where it disagrees: objects nobody boxed, likely wrong classes, sloppy boxes, and boxes it can't confirm. Worst first.</p>
+          <div class="row"><button class="btn btn-primary" id="qa-go">{{ icon('search') }}Check labelled frames <span id="qa-count"></span></button></div>
+          <div id="qa-job"></div>
+        </div>
+      </div>
+    </div>
+    <div class="panel" style="margin-top:16px">
+      <div class="panel-head"><h3>Frames worth a second look</h3><span class="meta" id="qa-meta"></span></div>
+      <div class="panel-body" id="qa-findings"><p class="small muted">Run “Find label mistakes” to fill this list.</p></div>
+    </div>
+  </section>
+
+  <!-- ── CLASSES ──────────────────────────────────────────────── -->
+  <section class="dash-section" data-section="classes">
+    <div class="grid-2">
+      <div class="panel">
+        <div class="panel-head"><h3>Classes</h3><span class="meta">Drag to reorder · order = YOLO class id</span></div>
+        <div class="panel-body stack">
+          <div class="class-list" id="cls-list"></div>
+          <div class="input-group" style="max-width:560px">
+            <input class="input" id="cls-new" placeholder="Add a class…"/>
+            <button class="btn" id="cls-add">{{ icon('plus') }}Add</button>
+          </div>
+        </div>
+        <div class="panel-foot"><span class="small muted" id="cls-dirty" style="margin-right:auto"></span><button class="btn btn-ghost" id="cls-reset">Discard</button><button class="btn btn-primary" id="cls-save">Save classes</button></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h3>How changes apply</h3></div>
+        <div class="panel-body stack small">
+          <p><b>Rename</b> — existing boxes follow the new name.</p>
+          <p><b>Reorder</b> — only the class ids in the exported labels change.</p>
+          <p><b>Remove</b> — existing boxes are kept but marked as an unknown class. They show in grey in the annotator and are skipped at export until you re-add the class or relabel them.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── EXPORT ───────────────────────────────────────────────── -->
+  <section class="dash-section" data-section="export">
+    <div class="grid-2">
+      <div class="panel">
+        <div class="panel-head"><h3>Split</h3><span class="meta" id="ex-total"></span></div>
+        <div class="panel-body stack">
+          <div class="splitbar" id="ex-split"></div>
+          <div class="row" style="gap:16px">
+            <label class="switch"><input type="checkbox" id="ex-test" checked/>Include a test split</label>
+            <label class="switch"><input type="checkbox" id="ex-group" checked/>Keep consecutive frames together</label>
+            <label class="switch"><input type="checkbox" id="ex-approved"/>Only approved frames</label>
+          </div>
+          <p class="small muted">Keeping runs of neighbouring frames in the same split stops near-duplicate frames from appearing in both train and validation, which would make validation scores look better than they are.</p>
+          <div class="divider" style="margin:4px 0"></div>
+          <button class="btn btn-success btn-lg" id="ex-go" style="align-self:flex-start">{{ icon('package') }}Export dataset</button>
+          <div class="hidden" id="ex-progress-wrap"><div class="row between small"><span class="muted">Copying images…</span><span class="num muted" id="ex-pct"></span></div><div class="progress" style="margin-top:6px"><span id="ex-bar"></span></div></div>
+          <div id="ex-result"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h3>data.yaml</h3><span class="meta" id="ex-out"></span></div>
+        <div class="panel-body"><pre class="yaml" id="ex-yaml">…</pre>
+          <p class="small muted" style="margin-top:12px">Exports include every image in the dataset (and ones exported before). Each export is written to a new folder next to the previous ones; images on the same drive are hard-linked, so an export takes almost no extra space.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <div class="panel-head"><h3>{{ icon('send') }}Train on a free cloud GPU (Kaggle / Colab)</h3><span class="meta">Uses the split settings above</span></div>
+      <div class="panel-body cloud-grid">
+        <div class="stack">
+          <p class="small">Packs the dataset with a ready-to-run notebook and script into one <code>.zip</code>. Upload it to Kaggle (≈30 free GPU hours a week) or Google Colab, press <b>Run all</b>, and bring the result back with <a class="link" href="/train#runs">Train model → Import cloud result</a>. The model then appears in your run history and can pre-label new frames here.</p>
+          <div class="grid-3">
+            <div class="field"><label for="cl-model">Model</label>
+              <select class="select" id="cl-model"><option value="yolo11n.pt">YOLO11 nano (fastest)</option><option value="yolo11s.pt" selected>YOLO11 small (good default)</option><option value="yolo11m.pt">YOLO11 medium (more accurate)</option><option value="yolo11l.pt">YOLO11 large</option></select></div>
+            <div class="field"><label for="cl-epochs">Epochs</label><input class="input" id="cl-epochs" type="number" min="1" max="3000" value="100"/></div>
+            <div class="field"><label for="cl-imgsz">Image size</label>
+              <select class="select" id="cl-imgsz"><option>416</option><option selected>640</option><option>800</option><option>1024</option></select></div>
+          </div>
+          <div class="row"><button class="btn btn-primary" id="cl-go">{{ icon('package') }}Build cloud bundle</button></div>
+          <div id="cl-job"></div>
+        </div>
+        <div>
+          <div class="small muted" style="margin-bottom:6px">Bundles</div>
+          <div class="bundle-list" id="cl-list"><p class="small muted">None yet.</p></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="bulkbar" id="bulkbar">
+    <span class="count" id="bulk-count"></span>
+    <div class="row" id="bulk-actions"></div>
+    <button class="btn btn-ghost btn-icon btn-sm" id="bulk-clear" aria-label="Clear selection">{{ icon('x') }}</button>
+  </div>
+</main>
+{% endblock %}
+{% block scripts %}
+<script>window.PROJECT_ID = {{ project_id|tojson }};</script>
+<script src="{{ asset('js/dashboard.js') }}"></script>
+{% endblock %}

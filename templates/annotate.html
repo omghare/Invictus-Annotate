@@ -1,150 +1,142 @@
+{% from "_brand.html" import brand_mark, icon, head_common %}
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Annotate — Invictus Annotate</title>
-  <link rel="stylesheet" href="/static/css/main.css"/>
-  <link rel="stylesheet" href="/static/css/annotate.css"/>
+  {{ head_common() }}
+  <link rel="stylesheet" href="{{ asset('css/annotate.css') }}"/>
+  <title>Annotate · Invictus Annotate</title>
 </head>
-<body>
-  <div class="annotate-layout">
+<body class="annotate">
+<div class="ann">
 
-    <!-- Top bar -->
-    <header class="ann-topbar">
-      <a href="#" class="back-btn" id="back-btn">← Project</a>
-      <span style="color:var(--border-strong)">|</span>
-      <span class="ann-filename" id="topbar-filename">Loading…</span>
-      <span id="save-status" class="save-status saved">● Saved</span>
+  <!-- ── Top bar ──────────────────────────────────────────────── -->
+  <header class="ann-top">
+    <a class="btn btn-ghost btn-sm" id="back-btn" href="/home">{{ icon('arrow-left') }}<span id="back-label">Back</span></a>
+    <div class="ann-title">
+      <span class="muted" id="t-project"></span><span class="sep">/</span><b id="t-file">Loading…</b>
+    </div>
+    <span class="ann-frame num" id="t-frame"></span>
+    <span class="save-pill" id="save-pill" data-state="saved"><span class="dot"></span><span class="txt">Saved</span></span>
+    <div class="topbar-spacer"></div>
+    <span class="ann-progress num" id="t-progress"></span>
+    <span class="conn"><span class="conn-dot"></span><span class="conn-label">Connecting</span></span>
+    <button class="btn btn-success btn-sm" id="submit-btn" disabled data-tip="Add this frame to the dataset (Ctrl+Enter)" data-tip-pos="bottom">{{ icon('check') }}Add to dataset</button>
+  </header>
 
-      <div class="ann-topbar-spacer"></div>
-
-      <!-- Connection -->
-      <div class="conn-indicator">
-        <div class="conn-dot" id="conn-dot"></div>
-        <span id="conn-label">Connecting</span>
+  <!-- ── Filmstrip ────────────────────────────────────────────── -->
+  <aside class="strip">
+    <div class="strip-head">
+      <div class="seg seg-sm" id="strip-filter">
+        <button class="active" data-v="all">All</button><button data-v="todo">To do</button><button data-v="done">Done</button><button data-v="fix" data-tip="Frames a reviewer sent back">Fix</button>
       </div>
+      <span class="muted small num" id="strip-count"></span>
+    </div>
+    <div class="strip-list" id="strip"><div class="strip-spacer" id="strip-spacer"></div></div>
+    <div class="strip-sel hidden" id="strip-sel">
+      <span id="strip-sel-txt"></span>
+      <button class="btn btn-ghost btn-sm" id="strip-sel-clear">Clear</button>
+    </div>
+    <div class="strip-foot">
+      <button class="btn btn-sm btn-block" id="submit-all-btn" disabled>{{ icon('check-check') }}<span>Add All Annotated Images to Dataset</span></button>
+    </div>
+  </aside>
 
-      <button class="submit-btn" id="submit-btn" disabled>✓ Add to Dataset</button>
-    </header>
-
-    <!-- Left: image list -->
-    <aside class="img-list-panel">
-      <div class="img-list-header">
-        <span>Images</span>
-        <span id="img-count" style="font-size:10px;color:var(--text-muted)"></span>
+  <!-- ── Canvas ───────────────────────────────────────────────── -->
+  <main class="stage" id="stage">
+    <canvas id="canvas"></canvas>
+    <div class="stage-loading hidden" id="stage-loading"><span class="spinner"></span></div>
+    <div class="stage-banners">
+      <div class="stage-banner hidden" id="carry-banner">
+        {{ icon('repeat-2') }}<span id="carry-text">Boxes carried from the previous frame</span>
+        <span class="kbd">Enter</span><span class="muted">keep</span><span class="kbd">Esc</span><span class="muted">discard</span>
       </div>
-      <div id="img-list"></div>
-      <div class="img-list-actions">
-        <button class="btn btn-primary btn-sm" id="submit-all-btn" style="width:100%; justify-content:center;" disabled>
-          ✓ Add All Annotated
-        </button>
+      <div class="stage-banner model hidden" id="model-banner">
+        {{ icon('sparkle') }}<span id="model-text">Model suggestions</span>
+        <span class="kbd">Enter</span><span class="muted">accept all</span><span class="muted">· edit or delete any box first</span>
       </div>
-    </aside>
+      <div class="stage-banner danger hidden" id="review-banner">{{ icon('flag') }}<span id="review-text"></span></div>
+      <div class="stage-banner info hidden" id="readonly-banner">{{ icon('package') }}<span>Exported — a change sends it back to “annotated” for re-review</span></div>
+      <div class="stage-banner warn hidden" id="conflict-banner">{{ icon('circle-alert') }}<span id="conflict-text">Someone else changed this frame</span>
+        <button class="btn btn-sm" id="conflict-reload">Load their version</button></div>
+      <div class="stage-banner info hidden" id="bg-banner">{{ icon('ban') }}<span>Marked as background — no objects on this frame</span></div>
+    </div>
+    <div class="stage-missing hidden" id="missing-panel">
+      <div class="empty-art">{{ icon('image-off') }}</div>
+      <h3>Image file not found</h3>
+      <p id="missing-text"></p>
+      <code class="hidden" id="missing-path"></code>
+      <a class="btn btn-sm hidden" id="missing-fix" href="#">{{ icon('refresh-cw') }}Relink the project's images</a>
+    </div>
 
-    <!-- Center: canvas -->
-    <main class="canvas-area" id="canvas-area">
-      <canvas id="ann-canvas"></canvas>
-
-      <!-- Zoom controls -->
-      <div class="zoom-controls">
-        <button class="zoom-btn" id="zoom-out" title="Zoom out">−</button>
-        <span class="zoom-level" id="zoom-level">100%</span>
-        <button class="zoom-btn" id="zoom-in" title="Zoom in">+</button>
-        <button class="zoom-btn" id="zoom-fit" title="Fit image" style="font-size:12px">⊡</button>
+    <div class="statusbar">
+      <div class="zoom">
+        <button class="btn btn-ghost btn-icon btn-sm" id="zoom-out" data-tip="Zoom out">{{ icon('zoom-out') }}</button>
+        <button class="zoom-val num" id="zoom-val" data-tip="Fit (0)">100%</button>
+        <button class="btn btn-ghost btn-icon btn-sm" id="zoom-in" data-tip="Zoom in">{{ icon('zoom-in') }}</button>
       </div>
-    </main>
+      <span class="sb-item num" id="sb-cursor">—</span>
+      <span class="sb-item num" id="sb-size"></span>
+      <span class="sb-item num" id="sb-boxes"></span>
+      <div class="topbar-spacer"></div>
+      <button class="btn btn-ghost btn-sm sb-toggle" id="qa-toggle" data-tip="Show the model's boxes for comparison (M)">{{ icon('sparkle') }}Model view <span class="kbd">M</span></button>
+      <button class="btn btn-ghost btn-sm sb-toggle" id="lock-zoom" data-tip="Keep zoom and position when moving between frames (L)">{{ icon('lock') }}Lock zoom <span class="kbd">L</span></button>
+      <button class="btn btn-ghost btn-sm" id="shortcuts-btn">{{ icon('keyboard') }}Shortcuts <span class="kbd">?</span></button>
+    </div>
+  </main>
 
-    <!-- Right: tools panel -->
-    <aside class="tool-panel">
-
-      <!-- Tools -->
-      <div class="tool-section">
-        <div class="tool-section-title">Tools</div>
-        <div class="shortcut-grid">
-          <button class="shortcut-btn" id="shortcut-draw" data-tip="Draw bounding box">
-            <span class="kb">B</span> Draw
-          </button>
-          <button class="shortcut-btn" id="shortcut-last" data-tip="Select last box">
-            <span class="kb">D</span> Last box
-          </button>
-          <button class="shortcut-btn" id="shortcut-copy" data-tip="Copy prev image boxes">
-            <span class="kb">R</span> Copy prev
-          </button>
-          <button class="shortcut-btn" id="shortcut-del" data-tip="Delete selected box">
-            <span class="kb">Del</span> Delete
-          </button>
-          <button class="shortcut-btn" id="shortcut-undo" data-tip="Undo">
-            <span class="kb">⌃Z</span> Undo
-          </button>
-          <button class="shortcut-btn" id="shortcut-prev" data-tip="Previous image">
-            <span class="kb">S/←</span> Prev
-          </button>
-          <button class="shortcut-btn" id="shortcut-next" data-tip="Next image">
-            <span class="kb">F/→</span> Next
-          </button>
-          <button class="shortcut-btn" id="shortcut-save" data-tip="Force save"
-                  onclick="IA._forceSave?.()">
-            <span class="kb">⌃S</span> Save
-          </button>
-        </div>
-        <div class="mt-8" style="font-size:10px;color:var(--text-muted);line-height:1.7">
-          <b>Enter</b> — confirm box &nbsp;·&nbsp;
-          <b>Esc</b> — deselect<br>
-          <b>Scroll</b> — zoom &nbsp;·&nbsp;
-          <b>Space+drag</b> — pan
-        </div>
+  <!-- ── Inspector ────────────────────────────────────────────── -->
+  <aside class="inspector">
+    <section class="insp-sec">
+      <div class="tools">
+        <button class="tool" id="tool-draw" data-tip="Draw boxes (B)">{{ icon('square-dashed') }}<span>Draw</span><kbd>B</kbd></button>
+        <button class="tool" id="tool-copy" data-tip="Copy boxes from the previous frame (R)">{{ icon('copy') }}<span>Copy prev</span><kbd>R</kbd></button>
+        <button class="tool" id="tool-undo" data-tip="Undo (Ctrl+Z)">{{ icon('undo-2') }}<span>Undo</span><kbd>⌃Z</kbd></button>
+        <button class="tool" id="tool-hide" data-tip="Hide boxes (tap H to toggle, hold H to peek)">{{ icon('eye-off') }}<span>Hide</span><kbd>H</kbd></button>
+        <button class="tool" id="tool-bg" data-tip="Mark this frame as having no objects (N)">{{ icon('ban') }}<span>No objects</span><kbd>N</kbd></button>
+        <button class="tool" id="tool-save" data-tip="Save now (Ctrl+S)">{{ icon('save') }}<span>Save</span><kbd>⌃S</kbd></button>
       </div>
+    </section>
 
-      <!-- Classes -->
-      <div class="tool-section">
-        <div class="tool-section-title">Classes</div>
-        <div class="class-list" id="class-list">
-          <div style="color:var(--text-muted);font-size:12px">Loading…</div>
-        </div>
+    <section class="insp-sec">
+      <div class="insp-title">Sequence</div>
+      <label class="seq-row switch" data-tip="New frames start with the previous frame's boxes (C)">
+        <input type="checkbox" id="carry-toggle"/><span>Carry boxes forward</span><kbd>C</kbd>
+      </label>
+      <div class="seq-actions">
+        <button class="btn btn-sm" id="prop-btn" data-tip="Copy these boxes to the next frames (P)">{{ icon('layers') }}Propagate…<kbd>P</kbd></button>
+        <button class="btn btn-sm" id="interp-btn" data-tip="Fill frames between two keyframes (I)">{{ icon('waypoints') }}Interpolate…<kbd>I</kbd></button>
       </div>
+      <button class="btn btn-ghost btn-sm btn-block hidden" id="undo-batch-btn">{{ icon('undo-2') }}<span></span></button>
+    </section>
 
-      <!-- Bounding boxes -->
-      <div class="tool-section" style="flex:1">
-        <div class="tool-section-title">Boxes on this image</div>
-        <div class="box-list" id="box-list">
-          <div class="box-empty">No boxes yet.<br>Press <b>B</b> to draw.</div>
-        </div>
+    <section class="insp-sec">
+      <div class="insp-title">Classes <input class="input input-sm cls-search hidden" id="cls-search" placeholder="Filter…"/></div>
+      <div class="cls-list" id="cls-list"></div>
+    </section>
+
+    <section class="insp-sec">
+      <div class="insp-title">View <button class="btn btn-ghost btn-sm" id="adj-reset" style="margin-left:auto">Reset</button></div>
+      <div class="adjust">
+        <label>Brightness<input type="range" id="adj-bright" min="40" max="220" value="100"/></label>
+        <label>Contrast<input type="range" id="adj-contrast" min="40" max="260" value="100"/></label>
+        <label class="switch"><input type="checkbox" id="adj-invert"/>Invert (X-ray style)</label>
       </div>
+    </section>
 
-    </aside>
-  </div>
+    <section class="insp-sec grow">
+      <div class="insp-title">Boxes <span class="muted num" id="box-count"></span></div>
+      <div class="box-list" id="box-list"></div>
+    </section>
+  </aside>
+</div>
 
-  <!-- Toast container -->
-  <div id="toast-container"></div>
-
-  <!-- Image ID from server -->
-  <script>
-    window.ANNOTATE_IMAGE_ID = "{{ image_id | default('') }}";
-    window.ANNOTATE_PROJECT_ID = "{{ project_id | default('') }}";
-  </script>
-
-  <!-- Socket.IO + IA utilities -->
-  <script src="/static/js/vendor/socket.io.min.js"></script>
-  <script src="/static/js/socket.js?v=2.0.0"></script>
-
-  <!-- Canvas engine -->
-  <script src="/static/js/annotate.js?v=2.0.0"></script>
-
-  <script>
-    // Update conn label on socket events
-    const origConnect = IA.connectSocket;
-    document.addEventListener('DOMContentLoaded', () => {
-      const dot   = document.getElementById('conn-dot');
-      const label = document.getElementById('conn-label');
-      if (dot && label) {
-        const observer = new MutationObserver(() => {
-          const connected = dot.classList.contains('connected');
-          label.textContent = connected ? 'Live' : 'Offline';
-        });
-        observer.observe(dot, { attributes: true });
-      }
-    });
-  </script>
+<div id="toasts"></div>
+<script>
+  window.ANNOTATE_IMAGE_ID = {{ image_id|tojson }};
+  window.ANNOTATE_PROJECT_ID = {{ project_id|tojson }};
+</script>
+<script src="/static/js/vendor/socket.io.min.js"></script>
+<script src="{{ asset('js/core.js') }}"></script>
+<script src="{{ asset('js/annotate.js') }}"></script>
 </body>
 </html>

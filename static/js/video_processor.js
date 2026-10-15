@@ -1,228 +1,145 @@
-const videoPlayer = document.getElementById('video-player');
-const slider = document.getElementById('video-slider');
-const btnPlay = document.getElementById('btn-play');
-const btnSetStart = document.getElementById('btn-set-start');
-const btnSetEnd = document.getElementById('btn-set-end');
-const btnExport = document.getElementById('btn-export');
-const lblCurrentTime = document.getElementById('lbl-current-time');
-const lblTotalTime = document.getElementById('lbl-total-time');
-const lblStartTime = document.getElementById('lbl-start-time');
-const lblEndTime = document.getElementById('lbl-end-time');
+/**
+ * video_processor.js — preview a server-side video and export a lossless clip.
+ */
+(async () => {
+'use strict';
 
-let currentVideoPath = null;
-let startTimeSec = 0;
-let endTimeSec = 0;
-let isVideoLoaded = false;
+const user = await IA.shell({ adminOnly: true, section: 'video' });
+if (!user) return;
+IA.setCrumbs([{ label: 'Video tools' }]);
+IA.connectSocket();
 
-function formatTime(seconds) {
-    if (isNaN(seconds) || !isFinite(seconds)) return "00:00:00.00";
-    const date = new Date(seconds * 1000);
-    const hh = String(date.getUTCHours()).padStart(2, '0');
-    const mm = String(date.getUTCMinutes()).padStart(2, '0');
-    const ss = String(date.getUTCSeconds()).padStart(2, '0');
-    const ms = String(date.getUTCMilliseconds()).padStart(3, '0').slice(0,2);
-    return `${hh}:${mm}:${ss}.${ms}`;
+const $ = (id) => document.getElementById(id);
+const video = $('video');
+let path = null, tIn = 0, tOut = 0, stats = null;
+
+// The browser may not be able to play the file (HEVC, some MKV): fall back to ffprobe's duration
+const duration = () => (isFinite(video.duration) && video.duration > 0 ? video.duration : stats?.duration || 0);
+/** "1:02.5", "00:01:02.50" or "62.5" → seconds */
+const parseTime = (t) => {
+  const parts = String(t).trim().split(':').map(Number);
+  if (!parts.length || parts.some((x) => !isFinite(x))) return NaN;
+  return parts.reduce((acc, x) => acc * 60 + x, 0);
+};
+const fmt = (s) => {
+  if (!isFinite(s)) return '00:00:00.00';
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${sec.toFixed(2).padStart(5, '0')}`;
+};
+
+function showStats(s, which) {
+  $('stats').querySelectorAll('dd').forEach((dd) => {
+    const k = dd.dataset.k;
+    const val = s ? ({ fps: `${s.fps} fps`, frames: IA.fmtNum(s.frames), avg_size_kb: `${s.avg_size_kb} KB` }[k] ?? s[k]) : '—';
+    if (which === 'src') dd.dataset.src = val;
+    else dd.dataset.clip = val;
+    dd.textContent = dd.dataset.clip ? `${dd.dataset.src} → ${dd.dataset.clip}` : dd.dataset.src || '—';
+  });
 }
 
-async function pickImportFile() {
-    try {
-        const res = await fetch('/api/video/pick_import');
-        if (res.ok) {
-            const data = await res.json();
-            document.getElementById('import-path').value = data.filepath;
-        } else {
-            console.log("No file selected or picker failed.");
-        }
-    } catch (e) {
-        console.error("Picker error", e);
-    }
+async function open() {
+  const p = $('path').value.trim().replace(/^"|"$/g, '');
+  if (!p) { IA.toast('Enter a video path or use Browse…', 'warn'); return; }
+  try { stats = await IA.post('/api/video/stats', { filepath: p }); }
+  catch (e) { IA.toast(e.message, 'error'); return; }
+  path = p;
+  tIn = 0; tOut = stats.duration || 0;                     // new video → new range, even if it can't play
+  $('stats').querySelectorAll('dd').forEach((dd) => { delete dd.dataset.clip; });
+  showStats(stats, 'src');
+  $('t-total').textContent = fmt(duration());
+  updateRange();
+  video.src = `/api/video/stream?path=${encodeURIComponent(path)}`;      // media cookie authenticates
+  video.classList.remove('hidden');
+  $('player-empty').classList.add('hidden');
+  $('result').innerHTML = '';
+  ['play', 'set-in', 'set-out', 'reset-range', 'export'].forEach((id) => { $(id).disabled = false; });
 }
 
-async function loadVideo() {
-    const pathInput = document.getElementById('import-path').value.trim();
-    if (!pathInput) {
-        alert("Please enter a valid video path.");
-        return;
-    }
+video.addEventListener('loadedmetadata', () => {
+  tIn = 0; tOut = duration();                              // new video → reset the selection
+  $('t-total').textContent = fmt(duration());
+  updateRange();
+});
+video.addEventListener('timeupdate', () => {
+  $('t-cur').textContent = fmt(video.currentTime);
+  $('head').style.left = `${(video.currentTime / (video.duration || 1)) * 100}%`;
+});
+video.addEventListener('play', () => { $('play').querySelector('span').textContent = 'Pause'; });
+video.addEventListener('pause', () => { $('play').querySelector('span').textContent = 'Play'; });
+video.addEventListener('error', () => { if (path) IA.toast('The browser cannot play this file. Click the start / end times to type them — export still works.', 'warn', 7000); });
 
-    currentVideoPath = pathInput;
-    
-    // Set video stream source
-    videoPlayer.src = `/api/video/stream?path=${encodeURIComponent(currentVideoPath)}`;
-    videoPlayer.load();
-
-    // Enable buttons
-    btnPlay.disabled = false;
-    btnSetStart.disabled = false;
-    btnSetEnd.disabled = false;
-    btnExport.disabled = false;
-    isVideoLoaded = true;
-
-    // Reset UI
-    document.getElementById('lbl-cut-fps').textContent = "N/A";
-    document.getElementById('lbl-cut-res').textContent = "N/A";
-    document.getElementById('lbl-cut-codec').textContent = "N/A";
-    document.getElementById('lbl-cut-frames').textContent = "N/A";
-    document.getElementById('lbl-cut-size').textContent = "N/A";
-
-    // Fetch Stats
-    try {
-        const res = await fetch('/api/video/stats', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ filepath: currentVideoPath })
-        });
-        if (res.ok) {
-            const stats = await res.json();
-            document.getElementById('lbl-src-fps').textContent = `${stats.fps} fps`;
-            document.getElementById('lbl-src-res').textContent = stats.resolution;
-            document.getElementById('lbl-src-codec').textContent = stats.codec;
-            document.getElementById('lbl-src-frames').textContent = `${stats.frames} frames`;
-            document.getElementById('lbl-src-size').textContent = `${stats.avg_size_kb} KB`;
-        }
-    } catch (e) {
-        console.error("Failed to load video stats", e);
-    }
+function updateRange() {
+  const d = duration() || 1;
+  const a = Math.min(tIn, tOut), b = Math.max(tIn, tOut);
+  $('range').style.left = `${(a / d) * 100}%`;
+  $('range').style.width = `${((b - a) / d) * 100}%`;
+  $('in-lbl').textContent = fmt(a);
+  $('out-lbl').textContent = fmt(b);
+  $('len-lbl').textContent = fmt(b - a);
 }
 
-function togglePlay() {
-    if (videoPlayer.paused) {
-        videoPlayer.play();
-    } else {
-        videoPlayer.pause();
-    }
-}
+let scrubbing = false;
+const seek = (e) => {
+  const r = $('track').getBoundingClientRect();
+  video.currentTime = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * (duration() || 0);
+};
+$('track').addEventListener('pointerdown', (e) => { if (!path) return; scrubbing = true; $('track').setPointerCapture(e.pointerId); seek(e); });
+$('track').addEventListener('pointermove', (e) => { if (scrubbing) seek(e); });
+$('track').addEventListener('pointerup', () => { scrubbing = false; });
 
-// Video Events
-videoPlayer.addEventListener('loadedmetadata', () => {
-    slider.max = videoPlayer.duration;
-    lblTotalTime.textContent = formatTime(videoPlayer.duration);
-    endTimeSec = videoPlayer.duration;
-    updateCutLabels();
+$('play').addEventListener('click', () => (video.paused ? video.play() : video.pause()));
+$('set-in').addEventListener('click', () => { tIn = video.currentTime; updateRange(); });
+$('set-out').addEventListener('click', () => { tOut = video.currentTime; updateRange(); });
+$('reset-range').addEventListener('click', () => { tIn = 0; tOut = duration(); updateRange(); });
+// Type an exact start / end (also the only way when the browser can't play the file)
+async function typeTime(which) {
+  if (!path) return;
+  const v = await IA.prompt({ title: which === 'in' ? 'Clip start' : 'Clip end', label: 'Time (h:mm:ss.ss, m:ss or seconds)',
+    value: fmt(which === 'in' ? Math.min(tIn, tOut) : Math.max(tIn, tOut)), confirmLabel: 'Set',
+    validate: (t) => { const s = parseTime(t); return !isFinite(s) || s < 0 || (duration() && s > duration()) ? 'Enter a time within the video' : ''; } });
+  if (v === null) return;
+  if (which === 'in') tIn = parseTime(v); else tOut = parseTime(v);
+  updateRange();
+}
+['in-lbl', 'out-lbl'].forEach((id) => {
+  $(id).style.cursor = 'pointer';
+  $(id).title = 'Click to type a time';
+  $(id).addEventListener('click', () => typeTime(id === 'in-lbl' ? 'in' : 'out'));
+});
+$('load').addEventListener('click', open);
+$('path').addEventListener('keydown', (e) => { if (e.key === 'Enter') open(); });
+$('browse').addEventListener('click', (e) => IA.busy(e.currentTarget, async () => {
+  IA.toast('The file dialog opens on the server screen', 'info', 2500);
+  try { $('path').value = (await IA.get('/api/video/pick_import')).filepath; await open(); }
+  catch (err) { if (err.status !== 400) IA.toast(err.message, 'error'); }
+}));
+
+document.addEventListener('keydown', (e) => {
+  if (!path || e.target.matches('input, textarea') || document.querySelector('.overlay')) return;
+  if (e.code === 'Space') { e.preventDefault(); $('play').click(); }
+  if (e.key === 'i' || e.key === 'I') $('set-in').click();
+  if (e.key === 'o' || e.key === 'O') $('set-out').click();
+  if (e.key === 'ArrowLeft') video.currentTime = Math.max(0, video.currentTime - (e.shiftKey ? 5 : 1 / (stats?.fps || 25)));
+  if (e.key === 'ArrowRight') video.currentTime = Math.min(duration(), video.currentTime + (e.shiftKey ? 5 : 1 / (stats?.fps || 25)));
 });
 
-videoPlayer.addEventListener('timeupdate', () => {
-    slider.value = videoPlayer.currentTime;
-    lblCurrentTime.textContent = formatTime(videoPlayer.currentTime);
-});
-
-slider.addEventListener('input', () => {
-    videoPlayer.currentTime = slider.value;
-});
-
-function setStartTime() {
-    startTimeSec = videoPlayer.currentTime;
-    updateCutLabels();
-}
-
-function setEndTime() {
-    endTimeSec = videoPlayer.currentTime;
-    updateCutLabels();
-}
-
-function updateCutLabels() {
-    lblStartTime.textContent = `Start: ${formatTime(startTimeSec)}`;
-    lblEndTime.textContent = `End:   ${formatTime(endTimeSec)}`;
-
-    const duration = videoPlayer.duration || 1;
-    let startPercent = (startTimeSec / duration) * 100;
-    let endPercent = (endTimeSec / duration) * 100;
-    
-    if (endPercent < startPercent) {
-        let temp = startPercent;
-        startPercent = endPercent;
-        endPercent = temp;
-    }
-
-    const highlight = document.getElementById('timeline-highlight');
-    if (highlight) {
-        highlight.style.left = `${startPercent}%`;
-        highlight.style.width = `${endPercent - startPercent}%`;
-    }
-
-    const mStart = document.getElementById('marker-start');
-    const mEnd = document.getElementById('marker-end');
-    if (mStart) {
-        mStart.style.display = 'block';
-        mStart.style.left = `${(startTimeSec / duration) * 100}%`;
-    }
-    if (mEnd) {
-        mEnd.style.display = 'block';
-        mEnd.style.left = `${(endTimeSec / duration) * 100}%`;
-    }
-}
-
-async function exportVideo() {
-    if (!currentVideoPath) return;
-
-    if (startTimeSec >= endTimeSec) {
-        alert("Timeline Error: In-Point (Start) must be before Out-Point (End).");
-        return;
-    }
-
-    // Call backend to open native save picker
-    const defaultNameMatch = currentVideoPath.match(/([^\\]+)(\.[^.]+)$/);
-    const defaultName = defaultNameMatch ? defaultNameMatch[1] + "_cut" + defaultNameMatch[2] : "cut_video.mp4";
-    let savePath = null;
-    
-    btnExport.disabled = true;
-    btnExport.textContent = "⏳ Waiting for location...";
-
-    try {
-        const pickerRes = await fetch(`/api/video/pick_export?default_name=${encodeURIComponent(defaultName)}`);
-        if (pickerRes.ok) {
-            const data = await pickerRes.json();
-            savePath = data.filepath;
-        }
-    } catch (e) {
-        console.error("Save picker failed", e);
-    }
-
-    if (!savePath) {
-        btnExport.disabled = false;
-        btnExport.textContent = "Export Lossless Cut";
-        return; // User cancelled
-    }
-
-    btnExport.textContent = "⏳ Exporting...";
-
-    try {
-        const res = await fetch('/api/video/cut', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                filepath: currentVideoPath,
-                save_path: savePath,
-                start_sec: startTimeSec,
-                end_sec: endTimeSec
-            })
-        });
-
-        if (res.ok) {
-            alert("Export Complete: Video exported losslessly!");
-            
-            // Fetch stats for the new video
-            const statsRes = await fetch('/api/video/stats', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filepath: savePath })
-            });
-            if (statsRes.ok) {
-                const stats = await statsRes.json();
-                document.getElementById('lbl-cut-fps').textContent = `${stats.fps} fps`;
-                document.getElementById('lbl-cut-res').textContent = stats.resolution;
-                document.getElementById('lbl-cut-codec').textContent = stats.codec;
-                document.getElementById('lbl-cut-frames').textContent = `${stats.frames} frames`;
-                document.getElementById('lbl-cut-size').textContent = `${stats.avg_size_kb} KB`;
-            }
-        } else {
-            const err = await res.json();
-            alert(`Export Failed: ${err.detail}`);
-        }
-    } catch (e) {
-        alert("Export Error: " + e.message);
-    } finally {
-        btnExport.disabled = false;
-        btnExport.textContent = "Export Lossless Cut";
-    }
-}
+$('export').addEventListener('click', (e) => IA.busy(e.currentTarget, async () => {
+  const a = Math.min(tIn, tOut), b = Math.max(tIn, tOut);
+  if (b - a < 0.05) { IA.toast('Set a start and end first', 'warn'); return; }
+  const base = path.split(/[\\/]/).pop();
+  const dot = base.lastIndexOf('.');
+  const defaultName = `${dot > 0 ? base.slice(0, dot) : base}_cut${dot > 0 ? base.slice(dot) : '.mp4'}`;
+  let save;
+  try {
+    IA.toast('Choose where to save — the dialog opens on the server screen', 'info', 2500);
+    save = (await IA.get(`/api/video/pick_export?default_name=${encodeURIComponent(defaultName)}`)).filepath;
+  } catch (err) { if (err.status !== 400) IA.toast(err.message, 'error'); return; }
+  try {
+    await IA.post('/api/video/cut', { filepath: path, save_path: save, start_sec: a, end_sec: b });
+    $('result').innerHTML = `<div class="callout success">${IA.icon('circle-check')}<div>Clip saved to <code>${IA.esc(save)}</code></div></div>`;
+    try { showStats(await IA.post('/api/video/stats', { filepath: save }), 'clip'); } catch { /* optional */ }
+  } catch (err) {
+    $('result').innerHTML = `<div class="callout danger">${IA.icon('circle-alert')}<div>${IA.esc(err.message)}</div></div>`;
+  }
+}));
+})();
